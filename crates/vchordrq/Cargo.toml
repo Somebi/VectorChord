@@ -17,6 +17,8 @@ pin-project = "1.1"
 serde.workspace = true
 validator.workspace = true
 zerocopy.workspace = true
+ndarray = "0.15"
+ndarray-npy = "0.8"
 
 [dev-dependencies]
 rand.workspace = true

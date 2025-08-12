@@ -23,9 +23,13 @@ use algo::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamil
 use algo::{BorrowedIter, Bump, RelationRead};
 use always_equal::AlwaysEqual;
 use distance::Distance;
+use ndarray::Array1;
+use ndarray_npy::write_npy;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::fs;
 use std::num::NonZero;
+use std::path::PathBuf;
 use vector::{VectorBorrowed, VectorOwned};
 
 type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
@@ -39,6 +43,7 @@ pub fn default_search<'b, R: RelationRead, O: Operator>(
     bump: &'b impl Bump,
     mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+    debug_dump: Option<&str>,
 ) -> Vec<(
     (Reverse<Distance>, AlwaysEqual<()>),
     AlwaysEqual<Extra0<'b>>,
@@ -86,6 +91,7 @@ where
 
     drop(meta_guard);
     let lut = O::Vector::preprocess(vector);
+    let mut routing = debug_dump.map(|_| (Vec::<u32>::new(), Vec::<f32>::new()));
 
     let mut step = |state: State| {
         let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
@@ -125,7 +131,14 @@ where
     };
 
     for i in (1..height_of_root).rev() {
-        state = step(state).take(probes[i as usize - 1] as _).collect();
+        let next_state: State = step(state).take(probes[i as usize - 1] as _).collect();
+        if let Some((ids, dists)) = routing.as_mut() {
+            for (Reverse(dis), _, AlwaysEqual(first)) in &next_state {
+                ids.push(*first);
+                dists.push(dis.to_f32());
+            }
+        }
+        state = next_state;
     }
 
     let mut results = LinkedVec::<(_, AlwaysEqual<Extra0<'b>>)>::new();
@@ -165,7 +178,34 @@ where
             &mut callback,
         );
     }
-    results.into_vec()
+    let mut out = results.into_vec();
+    if let Some(path) = debug_dump {
+        let mut ann_ids = Vec::new();
+        let mut ann_dists = Vec::new();
+        for ((Reverse(dis), _), AlwaysEqual(&mut (payload, ..))) in out.iter_mut() {
+            ann_ids.push(payload.get());
+            ann_dists.push(dis.to_f32());
+        }
+        if let Some((routing_ids, routing_dists)) = routing {
+            let base = PathBuf::from(path);
+            if let Some(parent) = base.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let mut p = base.clone();
+            p.set_extension("routing_ids.npy");
+            let _ = write_npy(&p, &Array1::from(routing_ids));
+            p = base.clone();
+            p.set_extension("routing_dists.npy");
+            let _ = write_npy(&p, &Array1::from(routing_dists));
+            p = base.clone();
+            p.set_extension("ann_ids.npy");
+            let _ = write_npy(&p, &Array1::from(ann_ids));
+            p = base.clone();
+            p.set_extension("ann_dists.npy");
+            let _ = write_npy(&p, &Array1::from(ann_dists));
+        }
+    }
+    out
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(
@@ -177,6 +217,7 @@ pub fn maxsim_search<'b, R: RelationRead, O: Operator>(
     bump: &'b impl Bump,
     mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+    debug_dump: Option<&str>,
 ) -> (
     Vec<(
         (Reverse<Distance>, AlwaysEqual<Distance>),
@@ -268,7 +309,14 @@ where
     let mut it = None;
     for i in (1..height_of_root).rev() {
         let it = it.insert(step(state));
-        state = it.take(probes[i as usize - 1] as _).collect();
+        let next_state: State = it.take(probes[i as usize - 1] as _).collect();
+        if let Some((ids, dists)) = routing.as_mut() {
+            for (Reverse(dis), _, AlwaysEqual(first)) in &next_state {
+                ids.push(*first);
+                dists.push(dis.to_f32());
+            }
+        }
+        state = next_state;
     }
 
     let mut results = LinkedVec::<(_, AlwaysEqual<Extra0<'b>>)>::new();
@@ -321,5 +369,32 @@ where
         threshold = threshold.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as _);
         estimation_by_threshold = distance;
     }
-    (results.into_vec(), estimation_by_threshold)
+    let mut out = results.into_vec();
+    if let Some(path) = debug_dump {
+        let mut ann_ids = Vec::new();
+        let mut ann_dists = Vec::new();
+        for ((Reverse(dis), _), AlwaysEqual(&mut (payload, ..))) in out.iter_mut() {
+            ann_ids.push(payload.get());
+            ann_dists.push(dis.to_f32());
+        }
+        if let Some((routing_ids, routing_dists)) = routing {
+            let base = PathBuf::from(path);
+            if let Some(parent) = base.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let mut p = base.clone();
+            p.set_extension("routing_ids.npy");
+            let _ = write_npy(&p, &Array1::from(routing_ids));
+            p = base.clone();
+            p.set_extension("routing_dists.npy");
+            let _ = write_npy(&p, &Array1::from(routing_dists));
+            p = base.clone();
+            p.set_extension("ann_ids.npy");
+            let _ = write_npy(&p, &Array1::from(ann_ids));
+            p = base.clone();
+            p.set_extension("ann_dists.npy");
+            let _ = write_npy(&p, &Array1::from(ann_dists));
+        }
+    }
+    (out, estimation_by_threshold)
 }

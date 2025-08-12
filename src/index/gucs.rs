@@ -77,6 +77,8 @@ static VCHORDRQ_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::ne
     PostgresIo::ReadStream,
 );
 
+static VCHORDRQ_DEBUG_DUMP: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
 pub fn init() {
     GucRegistry::define_bool_guc(
         c"vchordrq.enable_scan",
@@ -155,6 +157,14 @@ pub fn init() {
         c"`io_rerank` argument of vchordrq.",
         c"`io_rerank` argument of vchordrq.",
         &VCHORDRQ_IO_RERANK,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"vchordrq.debug_dump",
+        c"`debug_dump` argument of vchordrq.",
+        c"`debug_dump` argument of vchordrq.",
+        &VCHORDRQ_DEBUG_DUMP,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -330,4 +340,12 @@ pub fn vchordrq_io_rerank() -> Io {
         #[cfg(any(feature = "pg17", feature = "pg18"))]
         PostgresIo::ReadStream => Io::Stream,
     }
+}
+
+pub fn vchordrq_debug_dump() -> Option<String> {
+    VCHORDRQ_DEBUG_DUMP
+        .get()
+        .and_then(|s| s.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }

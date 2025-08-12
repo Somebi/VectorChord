@@ -13,6 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::index::fetcher::*;
+use crate::index::gucs::vchordrq_debug_dump;
 use crate::index::opclass::Sphere;
 use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordrq::algo::*;
@@ -115,6 +116,7 @@ impl SearchBuilder for DefaultBuilder {
             index,
             hints: Hints::default().full(true),
         };
+        let debug_dump = vchordrq_debug_dump();
         let f = move |(distance, payload)| (opfamily.output(distance), payload);
         let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> =
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
@@ -135,6 +137,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                         Io::Simple => default_search::<_, Op>(
                             index,
@@ -144,6 +147,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                         Io::Stream => default_search::<_, Op>(
                             index,
@@ -153,6 +157,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_stream_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                     };
                     let method = how(index);
@@ -268,6 +273,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                         Io::Simple => default_search::<_, Op>(
                             index,
@@ -277,6 +283,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                         Io::Stream => default_search::<_, Op>(
                             index,
@@ -286,6 +293,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_stream_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                     };
                     let method = how(index);
@@ -401,6 +409,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                         Io::Simple => default_search::<_, Op>(
                             index,
@@ -410,6 +419,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                         Io::Stream => default_search::<_, Op>(
                             index,
@@ -419,6 +429,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_stream_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                     };
                     let method = how(index);
@@ -534,6 +545,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                         Io::Simple => default_search::<_, Op>(
                             index,
@@ -543,6 +555,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                         Io::Stream => default_search::<_, Op>(
                             index,
@@ -552,6 +565,7 @@ impl SearchBuilder for DefaultBuilder {
                             bump,
                             make_h1_plain_prefetcher,
                             make_h0_stream_prefetcher,
+                            debug_dump.as_deref(),
                         ),
                     };
                     let method = how(index);
