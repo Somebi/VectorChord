@@ -13,6 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::index::fetcher::*;
+use crate::index::gucs::vchordrq_debug_dump;
 use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordrq::algo::*;
 use crate::index::vchordrq::filter::filter;
@@ -105,6 +106,7 @@ impl SearchBuilder for MaxsimBuilder {
             index,
             hints: Hints::default().full(true),
         };
+        let debug_dump = vchordrq_debug_dump();
         let n = vectors.len();
         let accu_map = |(Reverse(distance), AlwaysEqual(payload))| (distance, payload);
         let rough_map = |((_, AlwaysEqual(rough)), AlwaysEqual(&mut (payload, ..))): (
@@ -129,6 +131,7 @@ impl SearchBuilder for MaxsimBuilder {
                     .map(|vector| RandomProject::project(vector.as_borrowed()))
                     .collect::<Vec<_>>();
                 Box::new((0..n).map(move |i| {
+                    let dump_path = debug_dump.as_ref().map(|p| format!("{p}.{i}"));
                     let (results, estimation_by_threshold) = match options.io_search {
                         Io::Plain => maxsim_search::<_, Op>(
                             index,
@@ -139,6 +142,7 @@ impl SearchBuilder for MaxsimBuilder {
                             bump,
                             make_h1_plain_prefetcher.clone(),
                             make_h0_plain_prefetcher.clone(),
+                            dump_path.as_deref(),
                         ),
                         Io::Simple => maxsim_search::<_, Op>(
                             index,
@@ -149,6 +153,7 @@ impl SearchBuilder for MaxsimBuilder {
                             bump,
                             make_h1_plain_prefetcher.clone(),
                             make_h0_simple_prefetcher.clone(),
+                            dump_path.as_deref(),
                         ),
                         Io::Stream => maxsim_search::<_, Op>(
                             index,
@@ -159,6 +164,7 @@ impl SearchBuilder for MaxsimBuilder {
                             bump,
                             make_h1_plain_prefetcher.clone(),
                             make_h0_stream_prefetcher.clone(),
+                            dump_path.as_deref(),
                         ),
                     };
                     let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
@@ -270,6 +276,7 @@ impl SearchBuilder for MaxsimBuilder {
                     .map(|vector| RandomProject::project(vector.as_borrowed()))
                     .collect::<Vec<_>>();
                 Box::new((0..n).map(move |i| {
+                    let dump_path = debug_dump.as_ref().map(|p| format!("{p}.{i}"));
                     let (results, estimation_by_threshold) = match options.io_search {
                         Io::Plain => maxsim_search::<_, Op>(
                             index,
@@ -280,6 +287,7 @@ impl SearchBuilder for MaxsimBuilder {
                             bump,
                             make_h1_plain_prefetcher.clone(),
                             make_h0_plain_prefetcher.clone(),
+                            dump_path.as_deref(),
                         ),
                         Io::Simple => maxsim_search::<_, Op>(
                             index,
@@ -290,6 +298,7 @@ impl SearchBuilder for MaxsimBuilder {
                             bump,
                             make_h1_plain_prefetcher.clone(),
                             make_h0_simple_prefetcher.clone(),
+                            dump_path.as_deref(),
                         ),
                         Io::Stream => maxsim_search::<_, Op>(
                             index,
@@ -300,6 +309,7 @@ impl SearchBuilder for MaxsimBuilder {
                             bump,
                             make_h1_plain_prefetcher.clone(),
                             make_h0_stream_prefetcher.clone(),
+                            dump_path.as_deref(),
                         ),
                     };
                     let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
