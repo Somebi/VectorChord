@@ -19,13 +19,16 @@ use std::path::Path;
 
 fn compiler_version(cc: impl AsRef<Path>) -> Option<u16> {
     let cc = cc.as_ref();
-    if let Ok(r) = std::process::Command::new(cc).arg("-dumpversion").output()
-        && r.status.success()
-        && let Some(major) = r.stdout.split(|c| !c.is_ascii_digit()).next()
-        && let Ok(major) = std::str::from_utf8(major)
-        && let Ok(major) = major.parse::<u16>()
-    {
-        return Some(major);
+    if let Ok(r) = std::process::Command::new(cc).arg("-dumpversion").output() {
+        if r.status.success() {
+            if let Some(major) = r.stdout.split(|c| !c.is_ascii_digit()).next() {
+                if let Ok(major) = std::str::from_utf8(major) {
+                    if let Ok(major) = major.parse::<u16>() {
+                        return Some(major);
+                    }
+                }
+            }
+        }
     }
     None
 }
@@ -41,15 +44,15 @@ fn compiler(host: &str, target: &str, clang_version: u16, gcc_version: u16) -> O
         return None;
     }
     if host == target {
-        if let Ok(cc) = which::which("clang")
-            && compiler_version(&cc) >= Some(clang_version)
-        {
-            return Some(cc.into());
+        if let Ok(cc) = which::which("clang") {
+            if compiler_version(&cc) >= Some(clang_version) {
+                return Some(cc.into());
+            }
         }
-        if let Ok(cc) = which::which("gcc")
-            && compiler_version(&cc) >= Some(gcc_version)
-        {
-            return Some(cc.into());
+        if let Ok(cc) = which::which("gcc") {
+            if compiler_version(&cc) >= Some(gcc_version) {
+                return Some(cc.into());
+            }
         }
     }
     None
