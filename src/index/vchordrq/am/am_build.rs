@@ -1013,7 +1013,7 @@ struct CentroidRepresentative {
     doc_id: (u16, u16, u16), // ctid as [bi_hi, bi_lo, ip_posid]
     token_index: u16,        // extra field (token position in document)
     distance_to_centroid: f32, // how close this vector is to the computed centroid
-    id_text: Option<String>, // resolved id at selection time (avoids CTID churn)
+    id_info: Option<(String, String)>, // (col_name, id_value)
 }
 
 // ---------- CTID -> ID helpers and map ----------
@@ -1031,7 +1031,7 @@ fn parse_tid_text(t: &str) -> Option<(u32, u16)> {
     Some((blk, off))
 }
 
-fn build_ctid_id_map(heap_relid: pgrx::pg_sys::Oid) -> HashMap<(u32, u16), String> {
+fn build_ctid_id_map(heap_relid: pgrx::pg_sys::Oid) -> HashMap<(u32, u16), (String, String)> {
     let mut m = HashMap::new();
 
     unsafe {
@@ -1087,8 +1087,8 @@ fn build_ctid_id_map(heap_relid: pgrx::pg_sys::Oid) -> HashMap<(u32, u16), Strin
                     if let Ok(rows) = client.select(&sql, None, &[]) {
                         for r in rows {
                             if let (Some(tid_txt), Some(id_txt)) = (r.get_by_name::<String, _>("tid").unwrap_or(None), r.get_by_name::<String, _>("id").unwrap_or(None)) {
-                                if let Some((blk, off)) = parse_tid_text(&tid_txt) { 
-                                    m.insert((blk, off), id_txt); 
+                                if let Some((blk, off)) = parse_tid_text(&tid_txt) {
+                                    m.insert((blk, off), (col_name.to_string(), id_txt));
                                     populated = true;
                                 }
                             }
@@ -1140,9 +1140,9 @@ fn build_ctid_id_map(heap_relid: pgrx::pg_sys::Oid) -> HashMap<(u32, u16), Strin
 }
 
 fn id_from_map(
-    id_map: &HashMap<(u32, u16), String>,
+    id_map: &HashMap<(u32, u16), (String, String)>,
     doc_id: (u16, u16, u16),
-) -> Option<String> {
+) -> Option<(String, String)> {
     let blk = block_from_parts(doc_id.0, doc_id.1);
     let off = doc_id.2;
     id_map.get(&(blk, off)).cloned()
@@ -1191,10 +1191,10 @@ fn make_internal_build_with_tracking(
     vector_options: VectorOptions,
     internal_build: VchordrqInternalBuildOptions,
     mut samples: Vec<Vec<f32>>,
-    sample_origins: Vec<(u16, u16, u16, u16, Option<String>)>, // origin + pre-resolved id
+    sample_origins: Vec<(u16, u16, u16, u16, Option<(String, String)>)>, // origin + pre-resolved id
     reporter: &mut PostgresReporter,
     heap_relid_for_ids: pgrx::pg_sys::Oid,
-    id_map: &HashMap<(u32, u16), String>,
+    id_map: &HashMap<(u32, u16), (String, String)>,
 ) -> (Vec<Structure<Vec<f32>>>, Vec<Vec<CentroidRepresentative>>) {
     use std::iter::once;
     
@@ -1209,7 +1209,7 @@ fn make_internal_build_with_tracking(
         let (input, input_origins) = if let Some(structure) = result.last() {
             // For subsequent levels, use previous centroids as input
             // Origins would be the representatives from previous level
-            (&structure.centroids, centroid_representatives.last().unwrap().iter().map(|rep| (rep.doc_id.0, rep.doc_id.1, rep.doc_id.2, rep.token_index, rep.id_text.clone())).collect::<Vec<_>>())
+            (&structure.centroids, centroid_representatives.last().unwrap().iter().map(|rep| (rep.doc_id.0, rep.doc_id.1, rep.doc_id.2, rep.token_index, rep.id_info.clone())).collect::<Vec<_>>())
         } else {
             // First level uses original samples
             (&samples, sample_origins.clone())
@@ -1272,7 +1272,7 @@ fn make_internal_build_with_tracking(
                     let origin = input_origins[input_idx].clone();
                     let doc_id = (origin.0, origin.1, origin.2);
                     // Resolve id from map first, then fallback
-                    let id_text = origin
+                    let id_info = origin
                         .4
                         .clone()
                         .or_else(|| id_from_map(id_map, doc_id))
@@ -1281,7 +1281,7 @@ fn make_internal_build_with_tracking(
                         doc_id,
                         token_index: origin.3,
                         distance_to_centroid: distance,
-                        id_text,
+                        id_info,
                     });
                 }
             }
@@ -1290,7 +1290,7 @@ fn make_internal_build_with_tracking(
                 doc_id: (0, 0, 0),
                 token_index: 0,
                 distance_to_centroid: f32::INFINITY,
-                id_text: None,
+                id_info: None,
             }));
             
             if num_lists > 1 {
@@ -1307,7 +1307,7 @@ fn make_internal_build_with_tracking(
             }
         }
         
-        // Resolve and cache id_text for representatives now to avoid CTID drift later
+        // Resolve and cache id_info for representatives now to avoid CTID drift later
         let resolved_level_reps = level_representatives
             .into_iter()
             .map(|r| r)
@@ -1781,11 +1781,55 @@ fn analyze_and_report_cluster_distribution_with_centroids(
         for (cluster_id, count, percentage, centroid_rep) in entries {
             if let Some(rep) = centroid_rep {
                 // Attempt to fetch id column from the heap table using CTID
-                let images_id = rep
+                let images_id_info = rep
                     .id_text
                     .clone()
                     .or_else(|| id_from_map(id_map, rep.doc_id))
                     .or_else(|| fetch_heap_id_by_ctid(heap_relid, rep.doc_id));
+
+                let verified_id = match images_id_info {
+                    Some((col_name, id_value)) => {
+                        // Verify the ID exists in the table
+                        let is_real_id = unsafe {
+                            pgrx::spi::Spi::connect(|client| {
+                                let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+                                if rel.is_null() { return Ok(false); }
+                                let nsp = (*(*rel).rd_rel).relnamespace;
+                                let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+                                let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+                                let (schema, table) = if !relname.is_null() && !nspname.is_null() {
+                                    (CStr::from_ptr(nspname).to_string_lossy().to_string(), CStr::from_ptr(relname).to_string_lossy().to_string())
+                                } else {
+                                    ("".to_string(), "".to_string())
+                                };
+                                pgrx::pg_sys::RelationClose(rel);
+                                if schema.is_empty() || table.is_empty() { return Ok(false); }
+
+                                let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+                                let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+
+                                let sql = format!("SELECT 1 FROM {} WHERE {} = $1 LIMIT 1", qualified, quote_ident(&col_name));
+                                client.select(&sql, Some(1), &[(&id_value).into()]).map(|t| t.len() > 0)
+                            }).unwrap_or(false)
+                        };
+
+                        if is_real_id {
+                            Some(id_value)
+                        } else {
+                            pgrx::error!(
+                                "Verification failed: Centroid representative's id '{}' (from column '{}') not found in table. CTID: ({},{},{}). Stopping index build.",
+                                id_value, col_name, rep.doc_id.0, rep.doc_id.1, rep.doc_id.2
+                            );
+                        }
+                    }
+                    None => {
+                        pgrx::error!(
+                            "Failed to fetch a real document ID for centroid representative. CTID: ({},{},{}). Stopping index build.",
+                            rep.doc_id.0, rep.doc_id.1, rep.doc_id.2
+                        );
+                    }
+                };
+
                 pgrx::info!(
                     "  Cluster L{lvl}_C{cid}: {cnt} vectors ({pct:.2}%) - Centroid rep: doc(ctid_bi_hi={hi}, ctid_bi_lo={lo}, ip_posid={pos}, token_id={tok}) aka doc({hi},{lo},{pos})_token{tok} (id: {img_id}, dist: {dist:.4})",
                     lvl = level_idx,
@@ -1796,7 +1840,7 @@ fn analyze_and_report_cluster_distribution_with_centroids(
                     lo = rep.doc_id.1,
                     pos = rep.doc_id.2,
                     tok = rep.token_index,
-                    img_id = images_id.as_deref().unwrap_or("null"),
+                    img_id = verified_id.as_deref().unwrap_or("VERIFICATION_FAILED"),
                     dist = rep.distance_to_centroid
                 );
             } else {
@@ -1827,7 +1871,8 @@ fn analyze_and_report_cluster_distribution_with_centroids(
     pgrx::info!("=== END CLUSTER DISTRIBUTION ANALYSIS ===");
 }
 
-fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16)) -> Option<String> {
+fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16)) -> Option<(String, String)> {
+    pgrx::info!("DEBUG: Entering fetch_heap_id_by_ctid");
     // Resolve schema-qualified table name from relid
     unsafe {
         let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
@@ -1848,88 +1893,105 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
         let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
         let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
 
-        let mut value: Option<String> = None;
+        let mut value: Option<(String, String)> = None;
         let _ = pgrx::spi::Spi::connect(|client| {
             let check_sql = "SELECT 1 FROM pg_catalog.pg_attribute\n             WHERE attrelid = $1::regclass AND attname = 'id' AND NOT attisdropped\n             LIMIT 1";
             let has_id = match client.select(check_sql, None, &[heap_relid.into()]) {
-                Ok(rows) => rows.len() > 0,
-                Err(_) => false,
+                Ok(rows) => {
+                    pgrx::info!("id-lookup: check for 'id' column returned {} rows", rows.len());
+                    rows.len() > 0
+                },
+                Err(e) => {
+                    pgrx::warning!("id-lookup: check for 'id' column failed: {}", e);
+                    false
+                },
             };
             // Use a single text parameter and cast to tid: $1::tid
             let tid_param = format!("({}, {})", block, posid);
             if has_id {
+                pgrx::info!("id-lookup: 'id' column found, querying with ctid...");
                 let sql = format!(
                     "SELECT id::text AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
                     qualified
                 );
-                if let Ok(rows) = client.select(&sql, None, &[tid_param.clone().into()]) {
-                    if rows.len() > 0 {
-                        let row = rows.first();
-                        if let Ok(Some(id)) = row.get_by_name::<String, _>("id") {
-                            value = Some(id);
+                match client.select(&sql, None, &[tid_param.clone().into()]) {
+                    Ok(rows) if rows.len() > 0 => {
+                        if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                            pgrx::info!("id-lookup: success using 'id' column (ONLY). Found id: {}", id);
+                            value = Some(("id".to_string(), id));
                             return Ok::<_, pgrx::spi::Error>(());
                         }
                     }
-                }
-                // Retry without ONLY if not found (covers partition-parent relids)
-                let sql_all = format!(
-                    "SELECT id::text AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
-                    qualified
-                );
-                if let Ok(rows) = client.select(&sql_all, None, &[tid_param.clone().into()]) {
-                    if rows.len() > 0 {
-                        let row = rows.first();
-                        if let Ok(Some(id)) = row.get_by_name::<String, _>("id") {
-                            value = Some(id);
-                            return Ok::<_, pgrx::spi::Error>(());
+                    Ok(_) => {
+                        // Retry without ONLY
+                        let sql_all = format!(
+                            "SELECT id::text AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
+                            qualified
+                        );
+                        match client.select(&sql_all, None, &[tid_param.clone().into()]) {
+                            Ok(rows) if rows.len() > 0 => {
+                                if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                    pgrx::info!("id-lookup: success using 'id' column (no ONLY). Found id: {}", id);
+                                    value = Some(("id".to_string(), id));
+                                    return Ok::<_, pgrx::spi::Error>(());
+                                }
+                            }
+                            Ok(_) => pgrx::info!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY)"),
+                            Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed (no ONLY): {}", e),
                         }
                     }
+                    Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed (ONLY): {}", e),
                 }
+            } else {
+                pgrx::info!("id-lookup: 'id' column not found. Checking for primary key...");
             }
+            if value.is_some() { return Ok::<_, pgrx::spi::Error>(()); }
+
+            // 2. Try with Primary Key
             let pk_sql = "SELECT a.attname AS colname\n               FROM pg_index i\n               JOIN pg_attribute a\n                 ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)\n              WHERE i.indrelid = $1::regclass AND i.indisprimary\n                AND a.attnum > 0 AND NOT a.attisdropped\n              ORDER BY array_position(i.indkey, a.attnum) ASC\n              LIMIT 1";
-            if let Ok(pk_rows) = client.select(pk_sql, None, &[heap_relid.into()]) {
-                if pk_rows.len() > 0 {
-                    let col: Option<String> = pk_rows.first().get_by_name("colname").unwrap_or(None);
-                    if let Some(pk) = col {
-                        let col_quoted = quote_ident(&pk);
+            match client.select(pk_sql, None, &[heap_relid.into()]) {
+                Ok(pk_rows) if pk_rows.len() > 0 => {
+                    if let Some(pk_col_name) = pk_rows.first().get_by_name::<String, _>("colname").unwrap_or(None) {
+                        pgrx::info!("id-lookup: found primary key column: '{}'. Querying with ctid...", pk_col_name);
+                        let col_quoted = quote_ident(&pk_col_name);
                         let sql = format!(
                             "SELECT ({}::text) AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
                             col_quoted, qualified
                         );
-                        if let Ok(rows2) = client.select(&sql, None, &[tid_param.clone().into()]) {
-                            if rows2.len() > 0 {
-                                let row = rows2.first();
-                                if let Ok(Some(id)) = row.get_by_name::<String, _>("id") {
-                                    value = Some(id);
+                         match client.select(&sql, None, &[tid_param.clone().into()]) {
+                            Ok(rows) if rows.len() > 0 => {
+                                if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                    pgrx::info!("id-lookup: success using PK column '{}' (ONLY). Found id: {}", pk_col_name, id);
+                                    value = Some((pk_col_name.clone(), id));
                                     return Ok::<_, pgrx::spi::Error>(());
                                 }
                             }
-                        }
-                        // Retry without ONLY if not found
-                        let sql_all = format!(
-                            "SELECT ({}::text) AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
-                            col_quoted, qualified
-                        );
-                        if let Ok(rows3) = client.select(&sql_all, None, &[tid_param.clone().into()]) {
-                            if rows3.len() > 0 {
-                                let row = rows3.first();
-                                if let Ok(Some(id)) = row.get_by_name::<String, _>("id") {
-                                    value = Some(id);
-                                    return Ok::<_, pgrx::spi::Error>(());
+                            Ok(_) => {
+                                let sql_all = format!(
+                                    "SELECT ({}::text) AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
+                                    col_quoted, qualified
+                                );
+                                match client.select(&sql_all, None, &[tid_param.clone().into()]) {
+                                     Ok(rows) if rows.len() > 0 => {
+                                        if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                            pgrx::info!("id-lookup: success using PK column '{}' (no ONLY). Found id: {}", pk_col_name, id);
+                                            value = Some((pk_col_name.clone(), id));
+                                            return Ok::<_, pgrx::spi::Error>(());
+                                        }
+                                    }
+                                    Ok(_) => pgrx::info!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY)", pk_col_name),
+                                    Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed (no ONLY): {}", pk_col_name, e),
                                 }
                             }
+                            Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed (ONLY): {}", pk_col_name, e),
                         }
                     }
                 }
+                Ok(_) => pgrx::info!("id-lookup: no primary key found for table."),
+                Err(e) => pgrx::warning!("id-lookup: primary key lookup failed: {}", e),
             }
             Ok::<_, pgrx::spi::Error>(())
         });
-        if value.is_none() {
-            // Fallback to a stable hash derived from CTID so we always show something meaningful
-            let fallback = format_doc_hash(doc_id);
-            pgrx::info!("id-lookup: falling back to CTID-derived hash: {fallback}");
-            value = Some(fallback);
-        }
         return value;
     }
 }
