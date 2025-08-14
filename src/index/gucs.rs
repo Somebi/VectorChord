@@ -343,9 +343,8 @@ pub fn vchordrq_io_rerank() -> Io {
 }
 
 pub fn vchordrq_debug_dump() -> Option<String> {
-    VCHORDRQ_DEBUG_DUMP
-        .get()
-        .and_then(|s| s.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    VCHORDRQ_DEBUG_DUMP.get().and_then(|s| match s.to_str() {
+        Ok(s) if !s.is_empty() => Some(s.to_owned()),
+        _ => None,
+    })
 }

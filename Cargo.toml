@@ -99,13 +99,22 @@ debug = "full"
 strip = "none"
 
 [profile.release]
-codegen-units = 1
-lto = "fat"
+codegen-units = 16
+lto = "thin"
 opt-level = 3
 debug = "none"
 strip = "debuginfo"
+incremental = true
 
 [profile.prof]
 inherits = "release"
 debug = "full"
+strip = "none"
+
+[profile.fast]
+inherits = "dev"
+codegen-units = 256
+opt-level = 0
+lto = "off"
+debug = "line-tables-only"
 strip = "none"

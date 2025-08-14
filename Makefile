@@ -2,6 +2,7 @@ PG_CONFIG ?= pg_config
 PKGLIBDIR := $(shell $(PG_CONFIG) --pkglibdir)
 SHAREDIR := $(shell $(PG_CONFIG) --sharedir)
 PROFILE ?= release
+JOBS ?=
 MKDIR ?= mkdir
 CP ?= cp
 
@@ -10,7 +11,7 @@ CP ?= cp
 all: build
 
 build:
-	PGRX_PG_CONFIG_PATH="$(PG_CONFIG)" cargo run -p make -- build --output ./build/raw --profile $(PROFILE)
+	PGRX_PG_CONFIG_PATH="$(PG_CONFIG)" cargo run -p make -- build --output ./build/raw --profile $(PROFILE) $(if $(JOBS),--jobs $(JOBS),)
 
 install:
 	$(MKDIR) -p $(DESTDIR)$(PKGLIBDIR) $(DESTDIR)$(SHAREDIR) && \

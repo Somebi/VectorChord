@@ -182,7 +182,7 @@ where
     if let Some(path) = debug_dump {
         let mut ann_ids = Vec::new();
         let mut ann_dists = Vec::new();
-        for ((Reverse(dis), _), AlwaysEqual(&mut (payload, ..))) in out.iter_mut() {
+        for &mut ((Reverse(ref mut dis), _), AlwaysEqual(&mut (payload, ..))) in out.iter_mut() {
             ann_ids.push(payload.get());
             ann_dists.push(dis.to_f32());
         }
@@ -268,6 +268,7 @@ where
 
     drop(meta_guard);
     let lut = O::Vector::preprocess(vector);
+    let mut routing = debug_dump.map(|_| (Vec::<u32>::new(), Vec::<f32>::new()));
 
     let mut step = |state: State| {
         let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
@@ -373,7 +374,7 @@ where
     if let Some(path) = debug_dump {
         let mut ann_ids = Vec::new();
         let mut ann_dists = Vec::new();
-        for ((Reverse(dis), _), AlwaysEqual(&mut (payload, ..))) in out.iter_mut() {
+		for &mut ((Reverse(ref mut dis), _), AlwaysEqual(&mut (payload, ..))) in out.iter_mut() {
             ann_ids.push(payload.get());
             ann_dists.push(dis.to_f32());
         }

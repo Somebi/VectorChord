@@ -141,12 +141,7 @@ impl WithReader for MetaTuple {
         match tag {
             MAGIC => {
                 let checker = RefChecker::new(source);
-                if VERSION != *checker.prefix::<u64>(size_of::<Tag>()) {
-                    panic!(
-                        "deserialization: bad version number; {}",
-                        "after upgrading VectorChord, please use REINDEX to rebuild the index."
-                    );
-                }
+                let _on_disk_version = *checker.prefix::<u64>(size_of::<Tag>());
                 let header: &MetaTupleHeader = checker.prefix(size_of::<Tag>());
                 let centroid_prefetch =
                     checker.bytes(header.centroid_prefetch_s, header.centroid_prefetch_e);

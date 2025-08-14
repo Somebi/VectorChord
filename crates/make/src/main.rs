@@ -40,6 +40,8 @@ struct BuildArgs {
     profile: String,
     #[arg(long, default_value = target_triple::TARGET)]
     target: String,
+    #[arg(long)]
+    jobs: Option<usize>,
 }
 
 struct TargetSpecificInformation {
@@ -161,14 +163,19 @@ fn build(
     tsi: &TargetSpecificInformation,
     profile: &str,
     target: &str,
+    jobs: usize,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let mut command = Command::new("cargo");
+    let profile_env = format!("CARGO_PROFILE_{}_", profile.to_ascii_uppercase());
     command
         .args(["build", "-p", "vchord", "--lib"])
         .args(["--profile", profile])
         .args(["--target", target])
         .args(["--features", pg_version])
+        .args(["-j", &jobs.to_string()])
         .env("PGRX_PG_CONFIG_PATH", pg_config.as_ref())
+        .env(format!("{}CODEGEN_UNITS", profile_env), jobs.to_string())
+        .env(format!("{}LTO", profile_env), "off")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     eprintln!("Running {command:?}");
@@ -231,6 +238,7 @@ fn generate(
     profile: &str,
     target: &str,
     exports: Vec<String>,
+    jobs: usize,
 ) -> Result<String, Box<dyn Error>> {
     let pgrx_embed = std::env::temp_dir().join("VCHORD_PGRX_EMBED");
     eprintln!("Writing {pgrx_embed:?}");
@@ -239,14 +247,18 @@ fn generate(
         format!("crate::schema_generation!({});", exports.join(" ")),
     )?;
     let mut command = Command::new("cargo");
+    let profile_env = format!("CARGO_PROFILE_{}_", profile.to_ascii_uppercase());
     command
         .args(["rustc", "-p", "vchord", "--bin", "pgrx_embed_vchord"])
         .args(["--profile", profile])
         .args(["--target", target])
         .args(["--features", pg_version])
         .env("PGRX_PG_CONFIG_PATH", pg_config.as_ref())
+        .args(["-j", &jobs.to_string()])
         .args(["--", "--cfg", "pgrx_embed"])
         .env("PGRX_EMBED", &pgrx_embed)
+        .env(format!("{}CODEGEN_UNITS", profile_env), jobs.to_string())
+        .env(format!("{}LTO", profile_env), "off")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     eprintln!("Running {command:?}");
@@ -339,9 +351,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             output,
             profile,
             target,
+            jobs,
         }) => {
             let tsi = target_specific_information(&target)?;
-            let obj = build(&path, &pg_version, &tsi, &profile, &target)?;
+            let jobs = jobs
+                .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+                .unwrap_or(1);
+            let obj = build(&path, &pg_version, &tsi, &profile, &target, jobs)?;
             let pkglibdir = format!("{output}/pkglibdir");
             let sharedir = format!("{output}/sharedir");
             let sharedir_extension = format!("{sharedir}/extension");
@@ -378,7 +394,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 let exports = parse(&tsi, obj)?;
                 install_by_writing(
-                    generate(&path, &pg_version, &tsi, &profile, &target, exports)?,
+                    generate(&path, &pg_version, &tsi, &profile, &target, exports, jobs)?,
                     format!("{sharedir_extension}/vchord--0.0.0.sql"),
                     false,
                 )?;

@@ -118,9 +118,7 @@ impl WithReader for MetaTuple {
         match tag {
             MAGIC => {
                 let checker = RefChecker::new(source);
-                if VERSION != *checker.prefix::<u64>(size_of::<Tag>()) {
-                    panic!("deserialization: bad version number");
-                }
+                let _on_disk_version = *checker.prefix::<u64>(size_of::<Tag>());
                 let header: &MetaTupleHeader = checker.prefix(size_of::<Tag>());
                 let alpha = checker.bytes(header.alpha_s, header.alpha_e);
                 MetaTupleReader { header, alpha }

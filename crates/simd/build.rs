@@ -66,6 +66,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match target_arch.as_str() {
         "aarch64" => {
             let mut build = cc::Build::new();
+            build.pic(true);
             if let Some(compiler) = compiler(&host, &target, 16, 14) {
                 build.compiler(compiler);
             }
@@ -75,6 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         "x86_64" => {
             let mut build = cc::Build::new();
+            build.pic(true);
             if let Some(compiler) = compiler(&host, &target, 16, 12) {
                 build.compiler(compiler);
             }

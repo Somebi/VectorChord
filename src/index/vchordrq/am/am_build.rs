@@ -30,6 +30,7 @@ use std::ops::Deref;
 use vchordrq::types::*;
 use vector::VectorOwned;
 use vector::vect::VectOwned;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
@@ -277,6 +278,9 @@ pub unsafe extern "C-unwind" fn ambuild(
         scan: std::ptr::null_mut(),
     };
     let mut reporter = PostgresReporter {};
+
+    let mut centroid_representatives_for_analysis: Option<Vec<Vec<CentroidRepresentative>>> = None;
+    let mut tuples_total_for_analysis: Option<u64> = None;
     let structures = match vchordrq_options.build.source.clone() {
         VchordrqBuildSourceOptions::External(external_build) => {
             reporter.phase(BuildPhase::from_code(BuildPhaseCode::ExternalBuild));
@@ -287,19 +291,32 @@ pub unsafe extern "C-unwind" fn ambuild(
         VchordrqBuildSourceOptions::Internal(internal_build) => {
             reporter.phase(BuildPhase::from_code(BuildPhaseCode::InternalBuild));
             let mut tuples_total = 0_u64;
-            let samples = 'a: {
+            let (samples, sample_origins) = 'a: {
                 let mut rand = rand::rng();
                 let Some(max_number_of_samples) = internal_build
                     .lists
                     .last()
                     .map(|x| x.saturating_mul(internal_build.sampling_factor))
                 else {
-                    break 'a Vec::new();
+                    break 'a (Vec::new(), Vec::new());
                 };
+
+                // Add detailed sampling log
+                pgrx::info!(
+                    "sampling: Using Reservoir Sampling, sampling {} vectors because {} = {} × {} (sampling_factor = {}, cluster_size = {})",
+                    max_number_of_samples,
+                    max_number_of_samples,
+                    internal_build.sampling_factor,
+                    internal_build.lists.last().unwrap(),
+                    internal_build.sampling_factor,
+                    internal_build.lists.last().unwrap()
+                );
+
                 let mut samples = Vec::new();
+                let mut sample_origins = Vec::new(); // Track origin and resolved id
                 let mut number_of_samples = 0_u32;
-                heap.traverse(false, |(_, store)| {
-                    for (vector, _) in store {
+                heap.traverse(false, |(ctid, store)| {
+                    for (vector, extra) in store {
                         let x = match vector {
                             OwnedVector::Vecf32(x) => VectOwned::build_to_vecf32(x.as_borrowed()),
                             OwnedVector::Vecf16(x) => VectOwned::build_to_vecf32(x.as_borrowed()),
@@ -311,28 +328,72 @@ pub unsafe extern "C-unwind" fn ambuild(
                         );
                         if number_of_samples < max_number_of_samples {
                             samples.push(x);
+                            let key = ctid_to_key(ctid);
+                            // Do NOT fetch id here; only resolve for chosen centroid representatives later
+                            sample_origins.push((key[0], key[1], key[2], extra, None));
                             number_of_samples += 1;
                         } else {
                             let index = rand.random_range(0..max_number_of_samples) as usize;
                             samples[index] = x;
+                            let key = ctid_to_key(ctid);
+                            // Do NOT fetch id here; only resolve for chosen centroid representatives later
+                            sample_origins[index] = (key[0], key[1], key[2], extra, None);
                         }
                     }
                     tuples_total += 1;
                 });
-                samples
+
+                pgrx::info!(
+                    "sampling: Completed reservoir sampling of {} vectors from {} total vectors in table",
+                    samples.len(),
+                    tuples_total
+                );
+
+                (samples, sample_origins)
             };
             reporter.tuples_total(tuples_total);
-            make_internal_build(
+            // Build once-per-build CTID -> ID map for reliable id resolution
+            let heap_relid = unsafe { (*heap.heap_relation).rd_id };
+            let id_map = build_ctid_id_map(heap_relid);
+
+            let (structures, centroid_representatives) = make_internal_build_with_tracking(
                 vector_options.clone(),
                 internal_build.clone(),
                 samples,
+                sample_origins,
                 &mut reporter,
-            )
+                heap_relid,
+                &id_map,
+            );
+            centroid_representatives_for_analysis = Some(centroid_representatives);
+            tuples_total_for_analysis = Some(tuples_total);
+            structures
         }
     };
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Build));
+    // Build consumes `vector_options` and `structures`; analysis below uses clones
+    let structures_for_analysis = structures
+        .iter()
+        .map(|s| Structure { centroids: s.centroids.clone(), children: s.children.clone() })
+        .collect::<Vec<_>>();
     crate::index::vchordrq::algo::build(vector_options, vchordrq_options.index, &index, structures);
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
+
+    // Add cluster distribution analysis
+    if let (VchordrqBuildSourceOptions::Internal(_), Some(centroid_representatives), Some(tuples_total)) = (&vchordrq_options.build.source, centroid_representatives_for_analysis, tuples_total_for_analysis) {
+        let assignments = collect_cluster_assignments(&structures_for_analysis, &heap);
+        let heap_relid = unsafe { (*heap.heap_relation).rd_id };
+        let id_map = build_ctid_id_map(heap_relid);
+        analyze_and_report_cluster_distribution_with_centroids(
+            &assignments,
+            &structures_for_analysis,
+            &centroid_representatives,
+            tuples_total,
+            heap_relid,
+            &id_map,
+        );
+    }
+
     let cache = if vchordrq_options.build.pin {
         let mut trace = vchordrq::cache(&index);
         trace.sort();
@@ -946,50 +1007,245 @@ unsafe fn options(
     (vector, rabitq)
 }
 
-fn make_internal_build(
+// Add this structure to track centroid representatives
+#[derive(Debug, Clone)]
+struct CentroidRepresentative {
+    doc_id: (u16, u16, u16), // ctid as [bi_hi, bi_lo, ip_posid]
+    token_index: u16,        // extra field (token position in document)
+    distance_to_centroid: f32, // how close this vector is to the computed centroid
+    id_text: Option<String>, // resolved id at selection time (avoids CTID churn)
+}
+
+// ---------- CTID -> ID helpers and map ----------
+
+fn block_from_parts(hi: u16, lo: u16) -> u32 {
+    ((hi as u32) << 16) | (lo as u32)
+}
+
+fn parse_tid_text(t: &str) -> Option<(u32, u16)> {
+    let t = t.trim();
+    let s = t.strip_prefix('(')?.strip_suffix(')')?;
+    let mut it = s.split(',');
+    let blk: u32 = it.next()?.trim().parse().ok()?;
+    let off: u16 = it.next()?.trim().parse().ok()?;
+    Some((blk, off))
+}
+
+fn build_ctid_id_map(heap_relid: pgrx::pg_sys::Oid) -> HashMap<(u32, u16), String> {
+    let mut m = HashMap::new();
+
+    unsafe {
+        let mut used_pk = false;
+        let mut is_partition = false;
+        let mut is_partitioned_parent = false;
+
+        let _ = pgrx::spi::Spi::connect(|client| {
+            let mut parent_relid = heap_relid;
+
+            let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+            if !rel.is_null() {
+                is_partition = (*(*rel).rd_rel).relispartition;
+                is_partitioned_parent =
+                    (*(*rel).rd_rel).relkind == pgrx::pg_sys::RELKIND_PARTITIONED_TABLE as i8;
+                pgrx::pg_sys::RelationClose(rel);
+            }
+
+            if is_partition {
+                let parent_query = format!("SELECT inhparent FROM pg_inherits WHERE inhrelid = {}", heap_relid);
+                if let Ok(table) = client.select(&parent_query, Some(1), &[]) {
+                    if let Some(row) = table.into_iter().next() {
+                        if let Ok(Some(oid)) = row.get_by_name::<pgrx::pg_sys::Oid, _>("inhparent") {
+                            parent_relid = oid;
+                        }
+                    }
+                }
+            }
+
+            let tables_to_query = if is_partition || is_partitioned_parent {
+                get_table_partitions(parent_relid, &client)
+            } else {
+                let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+                if rel.is_null() { return Ok::<_, pgrx::spi::Error>(()); }
+                let nsp = (*(*rel).rd_rel).relnamespace;
+                let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+                let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+                if relname.is_null() || nspname.is_null() {
+                    pgrx::pg_sys::RelationClose(rel);
+                    return Ok::<_, pgrx::spi::Error>(());
+                }
+                let schema = CStr::from_ptr(nspname).to_string_lossy().to_string();
+                let table = CStr::from_ptr(relname).to_string_lossy().to_string();
+                pgrx::pg_sys::RelationClose(rel);
+                let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+                vec![format!("{}.{}", quote_ident(&schema), quote_ident(&table))]
+            };
+
+            let mut query_and_populate = |col_name: &str| -> Result<bool, pgrx::spi::Error> {
+                let mut populated = false;
+                for t_name in &tables_to_query {
+                    let sql = format!("SELECT ctid::text AS tid, {}::text AS id FROM {}", col_name, t_name);
+                    if let Ok(rows) = client.select(&sql, None, &[]) {
+                        for r in rows {
+                            if let (Some(tid_txt), Some(id_txt)) = (r.get_by_name::<String, _>("tid").unwrap_or(None), r.get_by_name::<String, _>("id").unwrap_or(None)) {
+                                if let Some((blk, off)) = parse_tid_text(&tid_txt) { 
+                                    m.insert((blk, off), id_txt); 
+                                    populated = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(populated)
+            };
+
+            if query_and_populate("id")? {
+                // Populated with "id"
+            } else {
+                let pk_sql = format!(
+                    "SELECT a.attname AS colname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = {} AND i.indisprimary AND a.attnum > 0 AND NOT a.attisdropped ORDER BY array_position(i.indkey, a.attnum) ASC LIMIT 1",
+                    parent_relid // Use parent relid for PK lookup
+                );
+                if let Ok(pk_rows) = client.select(&pk_sql, None, &[]) {
+                    if let Some(col) = pk_rows.first().get_by_name::<String, _>("colname").unwrap_or(None) {
+                        used_pk = true;
+                        if query_and_populate(&format!("\"{}\"", col.replace('"', "\"\"")))? {
+                            // Populated with PK
+                        }
+                    }
+                }
+                if !used_pk {
+                    let has_ad_id_sql = format!("SELECT 1 FROM pg_attribute WHERE attrelid = {} AND attname = 'ad_id' AND NOT attisdropped LIMIT 1", heap_relid);
+                    if client.select(&has_ad_id_sql, None, &[]).map(|r| r.len() > 0).unwrap_or(false) {
+                        if query_and_populate("ad_id")? {
+                            // Populated with ad_id
+                        }
+                    }
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+
+        pgrx::info!(
+            "id-map: built {} entries (source: {}, partitioned: {})",
+            m.len(),
+            if used_pk { "primary key" } else { "id column" },
+            is_partition || is_partitioned_parent,
+        );
+        if m.is_empty() {
+            pgrx::warning!("id-map: empty map built; will rely on per-CTID fallback");
+        }
+    }
+
+    m
+}
+
+fn id_from_map(
+    id_map: &HashMap<(u32, u16), String>,
+    doc_id: (u16, u16, u16),
+) -> Option<String> {
+    let blk = block_from_parts(doc_id.0, doc_id.1);
+    let off = doc_id.2;
+    id_map.get(&(blk, off)).cloned()
+}
+
+// Add this structure to track cluster assignments with centroid info
+#[derive(Debug, Clone)]
+struct VectorAssignment {
+    doc_id: (u16, u16, u16), // ctid as [bi_hi, bi_lo, ip_posid]
+    token_index: u16,        // extra field (token position in document)
+    cluster_path: Vec<u32>,  // which clusters at each level
+    _distance: f32,           // distance to final centroid (unused for now)
+}
+
+// Add this structure to track detailed cluster info
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct ClusterInfo {
+    level: usize,
+    cluster_id: u32,
+    centroid_vector: Vec<f32>,
+    representative: Option<CentroidRepresentative>,
+    member_count: u64,
+    sample_members: Vec<(u16, u16, u16, u16)>, // Sample doc_ids and token_indices
+}
+
+// ---------- Partition Discovery Helper ----------
+fn get_table_partitions(heap_relid: pgrx::pg_sys::Oid, client: &pgrx::spi::SpiClient) -> Vec<String> {
+    let mut partitions = Vec::new();
+    let query = format!(
+        "SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = {}",
+        heap_relid
+    );
+    if let Ok(table) = client.select(&query, None, &[]) {
+        for row in table {
+            if let Ok(Some(part_name)) = row.get_by_name::<String, _>("inhrelid") {
+                partitions.push(part_name);
+            }
+        }
+    }
+    partitions
+}
+
+// Modified make_internal_build to track centroid representatives
+fn make_internal_build_with_tracking(
     vector_options: VectorOptions,
     internal_build: VchordrqInternalBuildOptions,
     mut samples: Vec<Vec<f32>>,
+    sample_origins: Vec<(u16, u16, u16, u16, Option<String>)>, // origin + pre-resolved id
     reporter: &mut PostgresReporter,
-) -> Vec<Structure<Vec<f32>>> {
+    heap_relid_for_ids: pgrx::pg_sys::Oid,
+    id_map: &HashMap<(u32, u16), String>,
+) -> (Vec<Structure<Vec<f32>>>, Vec<Vec<CentroidRepresentative>>) {
     use std::iter::once;
+    
     k_means::preprocess(internal_build.build_threads as _, &mut samples, |sample| {
         *sample = rabitq::rotate::rotate(sample)
     });
+    
     let mut result = Vec::<Structure<Vec<f32>>>::new();
+    let mut centroid_representatives = Vec::<Vec<CentroidRepresentative>>::new();
+    
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
-        let input = if let Some(structure) = result.last() {
-            &structure.centroids
+        let (input, input_origins) = if let Some(structure) = result.last() {
+            // For subsequent levels, use previous centroids as input
+            // Origins would be the representatives from previous level
+            (&structure.centroids, centroid_representatives.last().unwrap().iter().map(|rep| (rep.doc_id.0, rep.doc_id.1, rep.doc_id.2, rep.token_index, rep.id_text.clone())).collect::<Vec<_>>())
         } else {
-            &samples
+            // First level uses original samples
+            (&samples, sample_origins.clone())
         };
+        
         let num_threads = internal_build.build_threads as _;
         let num_points = input.len();
         let num_dims = vector_options.dims as usize;
         let num_lists = w as usize;
         let num_iterations = internal_build.kmeans_iterations as _;
+        
         if result.is_empty() {
             let percentage = 0;
             let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
-            let phase =
-                BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
+            let phase = BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
             reporter.phase(phase);
         }
+        
         if num_lists > 1 {
             pgrx::info!(
                 "clustering: starting, using {num_threads} threads, clustering {num_points} vectors of {num_dims} dimension into {num_lists} clusters, in {num_iterations} iterations"
             );
+            pgrx::info!(
+                "clustering: training centroids using {} samples",
+                num_points
+            );
         }
+        
         let centroids = k_means::k_means(
             num_threads,
             |i| {
                 pgrx::check_for_interrupts!();
                 if result.is_empty() {
-                    let percentage =
-                        ((i as f64 / num_iterations as f64) * 100.0).clamp(0.0, 100.0) as u16;
+                    let percentage = ((i as f64 / num_iterations as f64) * 100.0).clamp(0.0, 100.0) as u16;
                     let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
-                    let phase = BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage)
-                        .unwrap_or(default);
+                    let phase = BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
                     reporter.phase(phase);
                 }
                 if num_lists > 1 {
@@ -1002,16 +1258,73 @@ fn make_internal_build(
             internal_build.spherical_centroids,
             num_iterations,
         );
+        
+        // Find the closest original vector to each computed centroid
+        let mut level_representatives = Vec::new();
+        for (cluster_idx, centroid) in centroids.iter().enumerate() {
+            let mut best_representative = None;
+            let mut best_distance = f32::INFINITY;
+            
+            for (input_idx, input_vector) in input.iter().enumerate() {
+                let distance = f32::reduce_sum_of_d2(input_vector, centroid);
+                if distance < best_distance {
+                    best_distance = distance;
+                    let origin = input_origins[input_idx].clone();
+                    let doc_id = (origin.0, origin.1, origin.2);
+                    // Resolve id from map first, then fallback
+                    let id_text = origin
+                        .4
+                        .clone()
+                        .or_else(|| id_from_map(id_map, doc_id))
+                        .or_else(|| fetch_heap_id_by_ctid(heap_relid_for_ids, doc_id));
+                    best_representative = Some(CentroidRepresentative {
+                        doc_id,
+                        token_index: origin.3,
+                        distance_to_centroid: distance,
+                        id_text,
+                    });
+                }
+            }
+            
+            level_representatives.push(best_representative.unwrap_or(CentroidRepresentative {
+                doc_id: (0, 0, 0),
+                token_index: 0,
+                distance_to_centroid: f32::INFINITY,
+                id_text: None,
+            }));
+            
+            if num_lists > 1 {
+                let rep = &level_representatives[cluster_idx];
+                pgrx::info!(
+                    "clustering: centroid {cid}, representative document's token is doc(ctid_bi_hi={hi}, ctid_bi_lo={lo}, ip_posid={pos}, token_id={tok}) aka doc({hi},{lo},{pos})_token{tok} (token's distance from the centroid is: {dist:.4})",
+                    cid = cluster_idx,
+                    hi = rep.doc_id.0,
+                    lo = rep.doc_id.1,
+                    pos = rep.doc_id.2,
+                    tok = rep.token_index,
+                    dist = rep.distance_to_centroid
+                );
+            }
+        }
+        
+        // Resolve and cache id_text for representatives now to avoid CTID drift later
+        let resolved_level_reps = level_representatives
+            .into_iter()
+            .map(|r| r)
+            .collect::<Vec<_>>();
+        centroid_representatives.push(resolved_level_reps);
+        
         if result.is_empty() {
             let percentage = 100;
             let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
-            let phase =
-                BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
+            let phase = BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
             reporter.phase(phase);
         }
+        
         if num_lists > 1 {
             pgrx::info!("clustering: finished");
         }
+        
         if let Some(structure) = result.last() {
             let mut children = vec![Vec::new(); centroids.len()];
             for i in 0..structure.len() as u32 {
@@ -1033,7 +1346,8 @@ fn make_internal_build(
             });
         }
     }
-    result
+    
+    (result, centroid_representatives)
 }
 
 #[allow(clippy::collapsible_else_if)]
@@ -1312,5 +1626,310 @@ impl<R: RelationWrite<Page = PostgresPage<vchordrq::Opaque>>> RelationWrite
 
     fn search(&self, freespace: usize) -> Option<Self::WriteGuard<'_>> {
         self.relation.search(freespace)
+    }
+}
+
+// Add this structure to track cluster assignments
+// NOTE: Defined earlier in the file; keep only one definition
+
+// Add this function to collect cluster assignments during insertion
+fn collect_cluster_assignments(
+    structures: &[Structure<Vec<f32>>],
+    heap: &Heap,
+) -> Vec<VectorAssignment> {
+    
+    let mut assignments = Vec::new();
+    let mut total_processed = 0u64;
+    
+    pgrx::info!("=== COLLECTING CLUSTER ASSIGNMENTS ===");
+    
+    heap.traverse(false, |(ctid, store)| {
+        for (vector, extra) in store {
+            let key = ctid_to_key(ctid);
+            let doc_id = (key[0], key[1], key[2]);
+            // Do NOT fetch id for all tokens; we fetch only for centroid representatives later
+            let token_index = extra;
+            
+            // Convert to processing format
+            let x = match vector {
+                OwnedVector::Vecf32(x) => VectOwned::build_to_vecf32(x.as_borrowed()),
+                OwnedVector::Vecf16(x) => VectOwned::build_to_vecf32(x.as_borrowed()),
+            };
+            
+            // Find cluster assignment by traversing the hierarchy
+            let mut cluster_path = Vec::new();
+            let current_vec = &x;
+            
+            for structure in structures.iter() {
+                let mut best_cluster = 0;
+                let mut best_distance = f32::INFINITY;
+                
+                for (cluster_idx, centroid) in structure.centroids.iter().enumerate() {
+                    let distance = f32::reduce_sum_of_d2(current_vec, centroid);
+                    
+                    if distance < best_distance {
+                        best_distance = distance;
+                        best_cluster = cluster_idx as u32;
+                    }
+                }
+                
+                cluster_path.push(best_cluster);
+                
+                // For next level, we'd use the centroid as reference
+                // (simplified - actual implementation might differ)
+            }
+            
+            let final_distance = if let Some(structure) = structures.last() {
+                let final_cluster = cluster_path.last().copied().unwrap_or(0);
+                f32::reduce_sum_of_d2(&x, &structure.centroids[final_cluster as usize])
+            } else {
+                0.0
+            };
+            assignments.push(VectorAssignment {
+                doc_id,
+                token_index,
+                cluster_path,
+                _distance: final_distance,
+            });
+        }
+        total_processed += 1;
+        
+        if total_processed % 100000 == 0 {
+            pgrx::info!("assignment: processed {} documents", total_processed);
+        }
+    });
+    
+    pgrx::info!("assignment: completed processing {} documents with {} total vectors", 
+               total_processed, assignments.len());
+    
+    assignments
+}
+
+fn format_doc_hash(doc_id: (u16, u16, u16)) -> String {
+    // Derive a stable 16-byte hex id from CTID using splitmix64-based mixing
+    fn splitmix64(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E3779B97F4A7C15);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+        x ^ (x >> 31)
+    }
+    let (hi, lo, pos) = doc_id;
+    let seed = ((hi as u64) << 48) | ((lo as u64) << 32) | ((pos as u64) << 16) | 0x9E37u64;
+    let h1 = splitmix64(seed);
+    let h2 = splitmix64(seed ^ 0xDEADBEEFCAFEBABEu64);
+    let mut s = String::with_capacity(32);
+    for b in h1.to_be_bytes().into_iter().chain(h2.to_be_bytes()) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
+
+// Enhanced cluster distribution analysis with centroid representatives
+fn analyze_and_report_cluster_distribution_with_centroids(
+    assignments: &[VectorAssignment],
+    structures: &[Structure<Vec<f32>>],
+    centroid_representatives: &[Vec<CentroidRepresentative>],
+    total_vectors: u64,
+    heap_relid: pgrx::pg_sys::Oid,
+    id_map: &HashMap<(u32, u16), String>,
+) {
+    use std::collections::HashMap;
+    
+    pgrx::info!("=== DETAILED CLUSTER DISTRIBUTION ANALYSIS WITH CENTROIDS ===");
+    pgrx::info!("Total vectors analyzed: {}", assignments.len());
+    pgrx::info!("Total documents processed: {}", total_vectors);
+    pgrx::info!("Average vectors per document: {:.2}", assignments.len() as f64 / total_vectors as f64);
+    
+    for (level_idx, structure) in structures.iter().enumerate() {
+        let mut cluster_stats: HashMap<u32, (u64, Vec<(u16, u16, u16, u16)>)> = HashMap::new();
+        
+        for assignment in assignments {
+            if let Some(&cluster_id) = assignment.cluster_path.get(level_idx) {
+                let entry = cluster_stats.entry(cluster_id).or_insert((0, Vec::new()));
+                entry.0 += 1;
+                
+                if entry.1.len() < 5 {
+                    entry.1.push((
+                        assignment.doc_id.0,
+                        assignment.doc_id.1, 
+                        assignment.doc_id.2,
+                        assignment.token_index
+                    ));
+                }
+            }
+        }
+        
+        pgrx::info!("--- Level {} Analysis ({} clusters) ---", level_idx, structure.len());
+        
+        // Build entries for all clusters (including those with 0 vectors), then sort by size desc
+        let mut entries = Vec::with_capacity(structure.len());
+        for cluster_id in 0..structure.len() as u32 {
+            let (count, _sample_docs) = cluster_stats
+                .get(&cluster_id)
+                .cloned()
+                .unwrap_or((0, Vec::new()));
+            let percentage = (count as f64 / assignments.len() as f64) * 100.0;
+            let centroid_rep = centroid_representatives
+                .get(level_idx)
+                .and_then(|level| level.get(cluster_id as usize));
+            entries.push((cluster_id, count, percentage, centroid_rep));
+        }
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (cluster_id, count, percentage, centroid_rep) in entries {
+            if let Some(rep) = centroid_rep {
+                // Attempt to fetch id column from the heap table using CTID
+                let images_id = rep
+                    .id_text
+                    .clone()
+                    .or_else(|| id_from_map(id_map, rep.doc_id))
+                    .or_else(|| fetch_heap_id_by_ctid(heap_relid, rep.doc_id));
+                pgrx::info!(
+                    "  Cluster L{lvl}_C{cid}: {cnt} vectors ({pct:.2}%) - Centroid rep: doc(ctid_bi_hi={hi}, ctid_bi_lo={lo}, ip_posid={pos}, token_id={tok}) aka doc({hi},{lo},{pos})_token{tok} (id: {img_id}, dist: {dist:.4})",
+                    lvl = level_idx,
+                    cid = cluster_id,
+                    cnt = count,
+                    pct = percentage,
+                    hi = rep.doc_id.0,
+                    lo = rep.doc_id.1,
+                    pos = rep.doc_id.2,
+                    tok = rep.token_index,
+                    img_id = images_id.as_deref().unwrap_or("null"),
+                    dist = rep.distance_to_centroid
+                );
+            } else {
+                pgrx::info!(
+                    "  Cluster L{lvl}_C{cid}: {cnt} vectors ({pct:.2}%) - No centroid rep available",
+                    lvl = level_idx,
+                    cid = cluster_id,
+                    cnt = count,
+                    pct = percentage
+                );
+            }
+        }
+        
+        // Show statistics
+        let total_clusters_used = cluster_stats.len();
+        let avg_vectors_per_cluster = assignments.len() as f64 / total_clusters_used as f64;
+        let max_vectors = cluster_stats.values().map(|(count, _)| *count).max().unwrap_or(0);
+        let min_vectors = cluster_stats.values().map(|(count, _)| *count).min().unwrap_or(0);
+        
+        pgrx::info!("  Level {} Summary:", level_idx);
+        pgrx::info!("    - Clusters with vectors: {}/{}", total_clusters_used, structure.len());
+        pgrx::info!("    - Avg vectors per cluster: {:.1}", avg_vectors_per_cluster);
+        pgrx::info!("    - Max vectors in cluster: {}", max_vectors);
+        pgrx::info!("    - Min vectors in cluster: {}", min_vectors);
+    }
+    
+    // End of cluster distribution analysis (removed Multi-Vector Document Analysis per request)
+    pgrx::info!("=== END CLUSTER DISTRIBUTION ANALYSIS ===");
+}
+
+fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16)) -> Option<String> {
+    // Resolve schema-qualified table name from relid
+    unsafe {
+        let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+        if rel.is_null() { return None; }
+        let nsp = (*(*rel).rd_rel).relnamespace;
+        let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+        let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+        if relname.is_null() || nspname.is_null() {
+            pgrx::pg_sys::RelationClose(rel);
+            return None;
+        }
+        let schema = CStr::from_ptr(nspname).to_string_lossy().to_string();
+        let table = CStr::from_ptr(relname).to_string_lossy().to_string();
+        pgrx::pg_sys::RelationClose(rel);
+
+        let block: u32 = ((doc_id.0 as u32) << 16) | (doc_id.1 as u32);
+        let posid: u16 = doc_id.2;
+        let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+
+        let mut value: Option<String> = None;
+        let _ = pgrx::spi::Spi::connect(|client| {
+            let check_sql = "SELECT 1 FROM pg_catalog.pg_attribute\n             WHERE attrelid = $1::regclass AND attname = 'id' AND NOT attisdropped\n             LIMIT 1";
+            let has_id = match client.select(check_sql, None, &[heap_relid.into()]) {
+                Ok(rows) => rows.len() > 0,
+                Err(_) => false,
+            };
+            // Use a single text parameter and cast to tid: $1::tid
+            let tid_param = format!("({}, {})", block, posid);
+            if has_id {
+                let sql = format!(
+                    "SELECT id::text AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
+                    qualified
+                );
+                if let Ok(rows) = client.select(&sql, None, &[tid_param.clone().into()]) {
+                    if rows.len() > 0 {
+                        let row = rows.first();
+                        if let Ok(Some(id)) = row.get_by_name::<String, _>("id") {
+                            value = Some(id);
+                            return Ok::<_, pgrx::spi::Error>(());
+                        }
+                    }
+                }
+                // Retry without ONLY if not found (covers partition-parent relids)
+                let sql_all = format!(
+                    "SELECT id::text AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
+                    qualified
+                );
+                if let Ok(rows) = client.select(&sql_all, None, &[tid_param.clone().into()]) {
+                    if rows.len() > 0 {
+                        let row = rows.first();
+                        if let Ok(Some(id)) = row.get_by_name::<String, _>("id") {
+                            value = Some(id);
+                            return Ok::<_, pgrx::spi::Error>(());
+                        }
+                    }
+                }
+            }
+            let pk_sql = "SELECT a.attname AS colname\n               FROM pg_index i\n               JOIN pg_attribute a\n                 ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)\n              WHERE i.indrelid = $1::regclass AND i.indisprimary\n                AND a.attnum > 0 AND NOT a.attisdropped\n              ORDER BY array_position(i.indkey, a.attnum) ASC\n              LIMIT 1";
+            if let Ok(pk_rows) = client.select(pk_sql, None, &[heap_relid.into()]) {
+                if pk_rows.len() > 0 {
+                    let col: Option<String> = pk_rows.first().get_by_name("colname").unwrap_or(None);
+                    if let Some(pk) = col {
+                        let col_quoted = quote_ident(&pk);
+                        let sql = format!(
+                            "SELECT ({}::text) AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
+                            col_quoted, qualified
+                        );
+                        if let Ok(rows2) = client.select(&sql, None, &[tid_param.clone().into()]) {
+                            if rows2.len() > 0 {
+                                let row = rows2.first();
+                                if let Ok(Some(id)) = row.get_by_name::<String, _>("id") {
+                                    value = Some(id);
+                                    return Ok::<_, pgrx::spi::Error>(());
+                                }
+                            }
+                        }
+                        // Retry without ONLY if not found
+                        let sql_all = format!(
+                            "SELECT ({}::text) AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
+                            col_quoted, qualified
+                        );
+                        if let Ok(rows3) = client.select(&sql_all, None, &[tid_param.clone().into()]) {
+                            if rows3.len() > 0 {
+                                let row = rows3.first();
+                                if let Ok(Some(id)) = row.get_by_name::<String, _>("id") {
+                                    value = Some(id);
+                                    return Ok::<_, pgrx::spi::Error>(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+        if value.is_none() {
+            // Fallback to a stable hash derived from CTID so we always show something meaningful
+            let fallback = format_doc_hash(doc_id);
+            pgrx::info!("id-lookup: falling back to CTID-derived hash: {fallback}");
+            value = Some(fallback);
+        }
+        return value;
     }
 }

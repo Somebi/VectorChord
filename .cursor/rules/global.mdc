@@ -1,0 +1,8 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+If you made some changes in the code, then always verify that cargo build is not throwing any warnings or errors, else fix them all.
+You can use /var/local/VectorChord/scripts/install_extension.sh or relative path ./scripts/install_extension.sh to test extension building, its integration into postgres, all in one go.
+If you want to see whether index building logs, initial sampling, ANN and so on, then use AUTO_REINDEX=true ./scripts/install_extension.sh > index_building.log 2>&1 & and then timeout 30 tail -f index_building.log to see what's happening or wait until it finishes and then read log chunk by chunk or grep it.
