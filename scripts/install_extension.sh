@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build and install the VectorChord PostgreSQL extension inside a Docker container.
-# The script is idempotent and may be run multiple times safely.
+# Build and install the VectorChord PostgreSQL extension into an already running Docker container.
+# This script does NOT build images or create/start containers; that is handled by another project.
 
 set -euo pipefail
 
@@ -8,10 +8,12 @@ set -euo pipefail
 
 # Configuration variables (override via environment variables)
 POSTGRES_VERSION="${POSTGRES_VERSION:-17}"
-VECTORCHORD_VERSION="${VECTORCHORD_VERSION:-v0.4.3}"
+VECTORCHORD_VERSION="${VECTORCHORD_VERSION:-v0.5.0}"
 CONTAINER_NAME="${CONTAINER_NAME:-vchord_listings}"
 IMAGE_REPO="${IMAGE_REPO:-ghcr.io/tensorchord/vchord-postgres:pg${POSTGRES_VERSION}-${VECTORCHORD_VERSION}}"
 PATH_TO_POSTGRES_DATA="${PATH_TO_POSTGRES_DATA:-$(realpath "$(pwd)/../postgres_data")}" 
+# Host-shared path for dumping ANN samples; will be bind-mounted into container at /var/local/postgres_shared
+PATH_TO_SHARED="${PATH_TO_SHARED:-/var/local/postgres_shared}"
 DB_NAME="${DB_NAME:-listings_db}"
 DB_USER="${DB_USER:-listings_user}"
 DB_PASSWORD="${DB_PASSWORD:-listings_somebi_731}"
@@ -20,25 +22,23 @@ DB_PORT="${DB_PORT:-5432}"
 TARGET_VERSION="${EXT_VERSION_OVERRIDE:-}"
 AUTO_BUMP_PATCH="${AUTO_BUMP_PATCH:-true}"
 AUTO_REINDEX="${AUTO_REINDEX:-false}"  # Note: Actually performs DROP+CREATE, not REINDEX
+# If true, when GLIBC mismatch is detected, build and install the extension inside the container
+BUILD_IN_CONTAINER="${BUILD_IN_CONTAINER:-false}"
 REPO_URL="${REPO_URL:-https://github.com/tensorchord/VectorChord.git}"
 PG_PORT_IN_CONTAINER=5432
 
-# Ensure the container exists
-if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-  docker run -d \
-    --name "$CONTAINER_NAME" \
-    --cpus=32 --cpuset-cpus=0-31 \
-    -e POSTGRES_DB="$DB_NAME" \
-    -e POSTGRES_USER="$DB_USER" \
-    -e POSTGRES_PASSWORD="$DB_PASSWORD" \
-    -p "$DB_PORT":5432 \
-    -v "$PATH_TO_POSTGRES_DATA":/var/lib/postgresql/data \
-    --restart unless-stopped \
-    --memory=28g \
-    --shm-size=4g \
-    "$IMAGE_REPO"
-else
-  docker start "$CONTAINER_NAME" >/dev/null
+# Ensure host shared directory exists for ANN samples
+mkdir -p "$PATH_TO_SHARED"
+
+# Ensure the container is already running (managed externally)
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Error: docker is required but not found in PATH." >&2
+  exit 1
+fi
+if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+  echo "Error: required container '${CONTAINER_NAME}' is not running." >&2
+  echo "This script does not create or manage containers. Please start the container externally (image expected: ${IMAGE_REPO})." >&2
+  exit 1
 fi
 
 # Clone the repository if this script is run outside of it
@@ -85,44 +85,73 @@ rustup override set stable
 cargo --version
 
 # Optional: auto-bump patch version by generating install/upgrade SQL and updating control file
+# Only run auto-bump if no working extension exists in the container
 if [ "$AUTO_BUMP_PATCH" = true ]; then
-  CONTROL_DEFAULT_VERSION=$(sed -nE "s/^default_version = '([^']+)'/\1/p" vchord.control | head -n1 || true)
-  if [ -n "$CONTROL_DEFAULT_VERSION" ]; then
-    IFS='.' read -r MAJ MIN PAT <<<"$CONTROL_DEFAULT_VERSION"
-    if [[ -n "$MAJ" && -n "$MIN" && -n "$PAT" ]]; then
-      NEXT_VERSION="${MAJ}.${MIN}.$((PAT+1))"
-      # Determine base version for upgrade (prefer DB extversion if available and ready)
-      DB_READY=false
-      if docker exec "$CONTAINER_NAME" pg_isready -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" >/dev/null 2>&1; then
-        DB_READY=true
-      fi
-      if [ "$DB_READY" = true ]; then
-        DB_EXTVERSION=$(docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -tA -c "SELECT extversion FROM pg_extension WHERE extname='vchord';" 2>/dev/null | tr -d ' \t' || true)
-      else
-        DB_EXTVERSION=""
-      fi
-      FROM_VERSION_FOR_UPGRADE="${DB_EXTVERSION:-$CONTROL_DEFAULT_VERSION}"
-      # Create install SQL if missing by copying latest available install SQL
-      if [ ! -f "sql/install/vchord--${NEXT_VERSION}.sql" ]; then
-        mapfile -t AVAILABLE_INSTALL_VERSIONS < <(ls -1 sql/install/vchord--*.sql 2>/dev/null | sed -E "s#.*/vchord--(.*)\\.sql#\1#" | sort -V)
-        if [ ${#AVAILABLE_INSTALL_VERSIONS[@]} -gt 0 ]; then
-          LAST_INSTALL="${AVAILABLE_INSTALL_VERSIONS[-1]}"
-          cp "sql/install/vchord--${LAST_INSTALL}.sql" "sql/install/vchord--${NEXT_VERSION}.sql"
+  # Check if container has a working extension first
+  CONTAINER_READY=false
+  if docker exec "$CONTAINER_NAME" pg_isready -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" >/dev/null 2>&1; then
+    CONTAINER_READY=true
+  fi
+  
+  if [ "$CONTAINER_READY" = true ]; then
+    EXISTING_EXT_VERSION=$(docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -tA -c "SELECT extversion FROM pg_extension WHERE extname='vchord';" 2>/dev/null | tr -d ' \t' || true)
+    if [ -n "$EXISTING_EXT_VERSION" ]; then
+      echo "Container already has working vchord extension version ${EXISTING_EXT_VERSION}, skipping auto-bump to preserve stability"
+      echo "Set AUTO_BUMP_PATCH=false or manually remove the extension if you need to update"
+      AUTO_BUMP_PATCH=false
+    fi
+  fi
+  
+  if [ "$AUTO_BUMP_PATCH" = true ]; then
+    CONTROL_DEFAULT_VERSION=$(sed -nE "s/^default_version = '([^']+)'/\1/p" vchord.control | head -n1 || true)
+    if [ -n "$CONTROL_DEFAULT_VERSION" ]; then
+      IFS='.' read -r MAJ MIN PAT <<<"$CONTROL_DEFAULT_VERSION"
+      if [[ -n "$MAJ" && -n "$MIN" && -n "$PAT" ]]; then
+        NEXT_VERSION="${MAJ}.${MIN}.$((PAT+1))"
+        # Determine base version for upgrade (prefer DB extversion if available and ready)
+        DB_READY=false
+        if docker exec "$CONTAINER_NAME" pg_isready -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" >/dev/null 2>&1; then
+          DB_READY=true
+        fi
+        if [ "$DB_READY" = true ]; then
+          DB_EXTVERSION=$(docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -tA -c "SELECT extversion FROM pg_extension WHERE extname='vchord';" 2>/dev/null | tr -d ' \t' || true)
         else
-          echo "No install SQL templates found to copy from (sql/install)." >&2
-          exit 4
+          DB_EXTVERSION=""
+        fi
+        FROM_VERSION_FOR_UPGRADE="${DB_EXTVERSION:-$CONTROL_DEFAULT_VERSION}"
+        
+        # Only proceed if we have a valid upgrade path
+        if [ -n "$FROM_VERSION_FOR_UPGRADE" ] && [ "$FROM_VERSION_FOR_UPGRADE" != "$NEXT_VERSION" ]; then
+          # Create install SQL if missing by copying latest available install SQL
+          if [ ! -f "sql/install/vchord--${NEXT_VERSION}.sql" ]; then
+            mapfile -t AVAILABLE_INSTALL_VERSIONS < <(ls -1 sql/install/vchord--*.sql 2>/dev/null | sed -E "s#.*/vchord--(.*)\\.sql#\1#" | sort -V)
+            if [ ${#AVAILABLE_INSTALL_VERSIONS[@]} -gt 0 ]; then
+              LAST_INSTALL="${AVAILABLE_INSTALL_VERSIONS[-1]}"
+              cp "sql/install/vchord--${LAST_INSTALL}.sql" "sql/install/vchord--${NEXT_VERSION}.sql"
+            else
+              echo "No install SQL templates found to copy from (sql/install)." >&2
+              exit 4
+            fi
+          fi
+          
+          # Create upgrade SQL if missing (with proper content, not just comments)
+          if [ ! -f "sql/upgrade/vchord--${FROM_VERSION_FOR_UPGRADE}--${NEXT_VERSION}.sql" ]; then
+            {
+              echo "-- Upgrade from ${FROM_VERSION_FOR_UPGRADE} to ${NEXT_VERSION}"
+              echo "-- Generated by install_extension.sh with AUTO_BUMP_PATCH=true"
+              echo ""
+              echo "-- This is a version bump upgrade. No schema changes required."
+              echo "SELECT 1; -- Ensure the file has valid SQL content"
+            } > "sql/upgrade/vchord--${FROM_VERSION_FOR_UPGRADE}--${NEXT_VERSION}.sql"
+          fi
+          
+          # Update control file default_version
+          sed -i -E "s/^(default_version = ')${CONTROL_DEFAULT_VERSION}(')/\\1${NEXT_VERSION}\\2/" vchord.control
+          echo "Auto-bumped vchord version: ${CONTROL_DEFAULT_VERSION} -> ${NEXT_VERSION}"
+        else
+          echo "Skipping auto-bump: no valid upgrade path from ${FROM_VERSION_FOR_UPGRADE} to ${NEXT_VERSION}"
         fi
       fi
-      # Create upgrade SQL if missing (no-op body)
-      if [ ! -f "sql/upgrade/vchord--${FROM_VERSION_FOR_UPGRADE}--${NEXT_VERSION}.sql" ]; then
-        {
-          echo "-- Auto-generated no-op upgrade from ${FROM_VERSION_FOR_UPGRADE} to ${NEXT_VERSION}"
-          echo "-- Generated by install_extension.sh with AUTO_BUMP_PATCH=true"
-        } > "sql/upgrade/vchord--${FROM_VERSION_FOR_UPGRADE}--${NEXT_VERSION}.sql"
-      fi
-      # Update control file default_version
-      sed -i -E "s/^(default_version = ')${CONTROL_DEFAULT_VERSION}(')/\\1${NEXT_VERSION}\\2/" vchord.control
-      echo "Auto-bumped vchord version: ${CONTROL_DEFAULT_VERSION} -> ${NEXT_VERSION}"
     fi
   fi
 fi
@@ -135,12 +164,118 @@ make build JOBS="$JOBS"
 PKGLIBDIR=$(docker exec "$CONTAINER_NAME" pg_config --pkglibdir)
 SHAREDIR=$(docker exec "$CONTAINER_NAME" pg_config --sharedir)
 
-# Copy built artifacts into the container
-docker cp build/raw/pkglibdir/. "$CONTAINER_NAME:$PKGLIBDIR/"
-docker cp build/raw/sharedir/. "$CONTAINER_NAME:$SHAREDIR/"
+# Decide whether to deploy newly built artifacts into the container
+LOCAL_SO="build/raw/pkglibdir/vchord.so"
+REMOTE_SO="$PKGLIBDIR/vchord.so"
 
-# Restart the container
-docker restart "$CONTAINER_NAME"
+if [ ! -f "$LOCAL_SO" ]; then
+  echo "Local artifact $LOCAL_SO not found. Build may have failed." >&2
+  exit 1
+fi
+
+REMOTE_PRESENT=$(docker exec "$CONTAINER_NAME" sh -lc "[ -f '$REMOTE_SO' ] && echo yes || echo no" || echo no)
+
+# Detect GLIBC version in the container and the maximum GLIBC required by the built .so
+CONTAINER_GLIBC_VERSION=$(docker exec "$CONTAINER_NAME" sh -lc "getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print \$2}'" 2>/dev/null || true)
+if [ -z "$CONTAINER_GLIBC_VERSION" ]; then
+  CONTAINER_GLIBC_VERSION=$(docker exec "$CONTAINER_NAME" sh -lc "ldd --version 2>&1 | head -n1 | sed -E 's/.* ([0-9]+\.[0-9]+).*/\\1/'" 2>/dev/null || true)
+fi
+REQUIRED_GLIBC=$(strings "$LOCAL_SO" 2>/dev/null | grep -oE "GLIBC_[0-9]+\.[0-9]+" | sort -V | tail -n1 | sed -E "s/^GLIBC_//" || true)
+
+# Prefer sha256 if available
+if command -v sha256sum >/dev/null 2>&1; then
+  LOCAL_DIGEST=$(sha256sum "$LOCAL_SO" | awk '{print $1}')
+else
+  LOCAL_DIGEST=$(md5sum "$LOCAL_SO" | awk '{print $1}')
+fi
+
+REMOTE_DIGEST=$(docker exec "$CONTAINER_NAME" sh -lc "if command -v sha256sum >/dev/null 2>&1 && [ -f '$REMOTE_SO' ]; then sha256sum '$REMOTE_SO' | awk '{print \\\$1}'; elif [ -f '$REMOTE_SO' ]; then md5sum '$REMOTE_SO' | awk '{print \\\$1}'; else echo missing; fi" 2>/dev/null || echo missing)
+
+# Decide if we need to copy, but block copy if GLIBC would break the container
+NEED_COPY=false
+GLIBC_MISMATCH=false
+if [ -n "$REQUIRED_GLIBC" ] && [ -n "$CONTAINER_GLIBC_VERSION" ]; then
+  # If container glibc is older than required, block the copy to avoid breaking postgres
+  if [ "$(printf '%s\n%s\n' "$CONTAINER_GLIBC_VERSION" "$REQUIRED_GLIBC" | sort -V | head -n1)" != "$REQUIRED_GLIBC" ]; then
+    GLIBC_MISMATCH=true
+    echo "GLIBC compatibility check: container=$CONTAINER_GLIBC_VERSION, required_by_local_so=$REQUIRED_GLIBC"
+    echo "Refusing to copy host-built vchord.so into the container to avoid GLIBC mismatch (would cause postgres to fail at startup)."
+    echo "Hint: rebuild inside a matching environment (Debian bookworm) or set BUILD_IN_CONTAINER=true to build inside the container."
+  fi
+fi
+if [ "$REMOTE_PRESENT" = "no" ]; then
+  echo "No existing vchord.so in container."
+  NEED_COPY=true
+elif [ "$LOCAL_DIGEST" != "$REMOTE_DIGEST" ]; then
+  echo "Local vchord.so digest ($LOCAL_DIGEST) differs from remote ($REMOTE_DIGEST). Will copy."
+  NEED_COPY=true
+fi
+
+if [ "${FORCE_COPY:-false}" = true ]; then
+  echo "FORCE_COPY=true set; will copy artifacts regardless of digest."
+  NEED_COPY=true
+fi
+
+if [ "$GLIBC_MISMATCH" = true ]; then
+  if [ "$BUILD_IN_CONTAINER" = true ]; then
+    echo "BUILD_IN_CONTAINER=true: building and installing vchord inside container '$CONTAINER_NAME'..."
+    # 1) Ensure build deps in container
+    docker exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config libpq-dev postgresql-server-dev-${POSTGRES_VERSION} git" || {
+      echo "Error: failed to install build dependencies inside container." >&2
+      exit 5
+    }
+    # 2) Ensure Rust toolchain
+    docker exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; if [ ! -x \"/root/.cargo/bin/cargo\" ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y; fi" || {
+      echo "Error: failed to install rustup/cargo in container." >&2
+      exit 5
+    }
+    # 3) Copy source tree and build
+    docker exec "$CONTAINER_NAME" bash -lc "rm -rf /tmp/VectorChord" || true
+    docker cp . "$CONTAINER_NAME:/tmp/VectorChord"
+    # IMPORTANT: remove any host-built target to avoid GLIBC mismatch for build scripts
+    docker exec "$CONTAINER_NAME" bash -lc "rm -rf /tmp/VectorChord/target" || true
+    docker exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; export PATH=/root/.cargo/bin:\$PATH; . /root/.cargo/env 2>/dev/null || true; cd /tmp/VectorChord; PGRX_PG_CONFIG_PATH=pg_config cargo build -p vchord --lib --profile release --features pg${POSTGRES_VERSION} -j \$(nproc)" || {
+      echo "Error: cargo build failed inside container." >&2
+      exit 5
+    }
+    # 4) Install into container paths
+    docker exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; PKGLIB=\$(pg_config --pkglibdir); SHARE=\$(pg_config --sharedir); mkdir -p \"\$SHARE/extension\"; install -m 644 /tmp/VectorChord/target/release/libvchord.so \"\$PKGLIB/vchord.so\"; install -m 644 /tmp/VectorChord/vchord.control \"\$SHARE/extension/vchord.control\"; install -m 644 /tmp/VectorChord/sql/install/vchord--*.sql \"\$SHARE/extension/\"; install -m 644 /tmp/VectorChord/sql/upgrade/vchord--*.sql \"\$SHARE/extension/\"" || {
+      echo "Error: failed to install built artifacts inside container." >&2
+      exit 5
+    }
+    # 5) Sanity check: ensure installed binary contains the updated symbols
+    docker exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; PKGLIB=\$(pg_config --pkglibdir); strings \"\$PKGLIB/vchord.so\" | head -n 5 >/dev/null 2>&1 || true"
+    DID_COPY=true
+    NEED_COPY=false
+    GLIBC_MISMATCH=false
+  else
+    if [ "$REMOTE_PRESENT" = "no" ]; then
+      echo "Error: No existing vchord.so in container and local build requires newer GLIBC ($REQUIRED_GLIBC) than container has ($CONTAINER_GLIBC_VERSION)."
+      echo "Set BUILD_IN_CONTAINER=true to build inside the container and install a compatible binary."
+      exit 5
+    else
+      echo "Warning: GLIBC mismatch detected; skipping copy and leaving existing container binary in place."
+      NEED_COPY=false
+    fi
+  fi
+fi
+
+if [ "$NEED_COPY" = true ]; then
+  echo "Copying built artifacts into the container..."
+  # Backup existing .so for rollback if present
+  BACKUP_PATH="${REMOTE_SO}.bak.$(date +%s)"
+  if [ "$REMOTE_PRESENT" = "yes" ]; then
+    docker exec "$CONTAINER_NAME" sh -lc "cp '$REMOTE_SO' '$BACKUP_PATH'" || true
+  fi
+  docker cp build/raw/pkglibdir/. "$CONTAINER_NAME:$PKGLIBDIR/"
+  docker cp build/raw/sharedir/. "$CONTAINER_NAME:$SHAREDIR/"
+  echo "Note: container restart is NOT performed by this script."
+  echo "New backend sessions will load the updated library automatically when needed."
+  DID_COPY=true
+else
+  echo "Container already has matching vchord.so; skipping copy."
+  DID_COPY=false
+fi
 
 # Wait for PostgreSQL to be ready inside the container
 echo "$CONTAINER_NAME"
@@ -161,6 +296,22 @@ fi
 if ! docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -v ON_ERROR_STOP=1 -c "SELECT 1" >/dev/null 2>&1; then
   echo "Warning: unable to connect to Postgres as user '$DB_USER'. Skipping extension creation/update. Artifacts have been installed into the container."
   exit 0
+fi
+
+# If we deployed a new binary, sanity-check that it can be loaded; if not, roll back to the backup
+if [ "${DID_COPY:-false}" = true ]; then
+  if docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -v ON_ERROR_STOP=1 -tA -c "LOAD 'vchord'; SELECT 1;" >/dev/null 2>&1; then
+    echo "Post-copy LOAD check: ok"
+  else
+    echo "Post-copy LOAD check: failed. Restoring previous vchord.so to avoid breaking the container."
+    if docker exec "$CONTAINER_NAME" sh -lc "[ -f '${BACKUP_PATH:-}' ]" >/dev/null 2>&1; then
+      docker exec "$CONTAINER_NAME" sh -lc "mv '${BACKUP_PATH}' '$REMOTE_SO'" || true
+      echo "Rollback complete."
+    else
+      echo "Warning: backup was not found; cannot roll back automatically." >&2
+    fi
+    exit 6
+  fi
 fi
 
 CURRENT_VERSION=$(docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -tA -c "SELECT extversion FROM pg_extension WHERE extname='vchord';" 2>/dev/null | tr -d ' \t' || true)

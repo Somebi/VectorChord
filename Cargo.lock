@@ -1854,6 +1854,8 @@ dependencies = [
  "half 2.6.0",
  "k_means",
  "mimalloc",
+ "ndarray",
+ "ndarray-npy",
  "paste",
  "pgrx",
  "pgrx-catalog",

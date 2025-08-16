@@ -260,6 +260,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     index_relation: pgrx::pg_sys::Relation,
     index_info: *mut pgrx::pg_sys::IndexInfo,
 ) -> *mut pgrx::pg_sys::IndexBuildResult {
+    pgrx::info!("Debug: ambuild function called");
     use validator::Validate;
     let (vector_options, vchordrq_options) = unsafe { options(index_relation) };
     if let Err(errors) = Validate::validate(&vector_options) {
@@ -284,20 +285,31 @@ pub unsafe extern "C-unwind" fn ambuild(
     let structures = match vchordrq_options.build.source.clone() {
         VchordrqBuildSourceOptions::External(external_build) => {
             reporter.phase(BuildPhase::from_code(BuildPhaseCode::ExternalBuild));
+            pgrx::info!("Debug: Using External build source");
+            pgrx::info!("Debug: external_build = {:?}", external_build);
             let reltuples = unsafe { (*(*index_relation).rd_rel).reltuples };
             reporter.tuples_total(reltuples as u64);
             make_external_build(vector_options.clone(), opfamily, external_build.clone())
         }
         VchordrqBuildSourceOptions::Internal(internal_build) => {
             reporter.phase(BuildPhase::from_code(BuildPhaseCode::InternalBuild));
+            pgrx::info!("Debug: Using Internal build source");
+            pgrx::info!("Debug: internal_build = {:?}", internal_build);
             let mut tuples_total = 0_u64;
             let (samples, sample_origins) = 'a: {
                 let mut rand = rand::rng();
-                let Some(max_number_of_samples) = internal_build
+                pgrx::info!("Debug: internal_build.lists = {:?}", internal_build.lists);
+                pgrx::info!("Debug: internal_build.sampling_factor = {}", internal_build.sampling_factor);
+                
+                let max_number_of_samples = internal_build
                     .lists
                     .last()
-                    .map(|x| x.saturating_mul(internal_build.sampling_factor))
-                else {
+                    .map(|x| x.saturating_mul(internal_build.sampling_factor));
+                
+                pgrx::info!("Debug: max_number_of_samples = {:?}", max_number_of_samples);
+                
+                let Some(max_number_of_samples) = max_number_of_samples else {
+                    pgrx::info!("Debug: No max_number_of_samples, breaking with empty vectors");
                     break 'a (Vec::new(), Vec::new());
                 };
 
@@ -330,14 +342,14 @@ pub unsafe extern "C-unwind" fn ambuild(
                             samples.push(x);
                             let key = ctid_to_key(ctid);
                             // Do NOT fetch id here; only resolve for chosen centroid representatives later
-                            sample_origins.push((key[0], key[1], key[2], extra, None));
+                            sample_origins.push((key[0], key[1], key[2], extra, None::<(String, String)>));
                             number_of_samples += 1;
                         } else {
                             let index = rand.random_range(0..max_number_of_samples) as usize;
                             samples[index] = x;
                             let key = ctid_to_key(ctid);
                             // Do NOT fetch id here; only resolve for chosen centroid representatives later
-                            sample_origins[index] = (key[0], key[1], key[2], extra, None);
+                            sample_origins[index] = (key[0], key[1], key[2], extra, None::<(String, String)>);
                         }
                     }
                     tuples_total += 1;
@@ -349,8 +361,117 @@ pub unsafe extern "C-unwind" fn ambuild(
                     tuples_total
                 );
 
-                (samples, sample_origins)
+                // Save samples to file and exit
+                pgrx::info!("saving {} samples to ann_samples.npy", samples.len());
+                
+                // Convert samples to raw bytes for numpy compatibility
+                let mut file_data = Vec::new();
+                
+                // Write numpy .npy header
+                // Magic string
+                file_data.extend_from_slice(b"\x93NUMPY");
+                // Version
+                file_data.extend_from_slice(b"\x01\x00");
+                
+                // Header length (will be filled later)
+                let header_start = file_data.len();
+                file_data.extend_from_slice(b"\x00\x00");
+                
+                // Header content
+                let shape_str = format!("({}, {})", samples.len(), vector_options.dims);
+                let dtype_str = "<f4"; // little-endian float32
+                let header = format!("{{'descr': '{}', 'fortran_order': False, 'shape': {}}}", dtype_str, shape_str);
+                
+                // Pad header to be divisible by 16
+                let header_bytes = header.as_bytes();
+                let header_len = header_bytes.len();
+                let padding_needed = (16 - (header_len % 16)) % 16;
+                let total_header_len = header_len + padding_needed;
+                
+                // Write header
+                file_data.extend_from_slice(header_bytes);
+                for _ in 0..padding_needed {
+                    file_data.push(b' ');
+                }
+                
+                // Update header length
+                let header_len_bytes = (total_header_len as u16).to_le_bytes();
+                file_data[header_start..header_start + 2].copy_from_slice(&header_len_bytes);
+                
+                // Write sample data
+                for sample in &samples {
+                    for &value in sample {
+                        file_data.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                
+                // Get current working directory for debugging
+                let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("unknown"));
+                pgrx::info!("Current working directory: {:?}", current_dir);
+                
+                // Write to the shared directory that's mounted from host
+                let file_path = "/var/local/postgres_shared/ann_samples.npy";
+                pgrx::info!("Attempting to write to: {}", file_path);
+                
+                // Try to write to the primary location first
+                let write_result = std::fs::write(file_path, &file_data);
+                if write_result.is_ok() {
+                    pgrx::info!("Successfully saved {} samples to {}", samples.len(), file_path);
+                    
+                    // Relax permissions so host can read
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o666)) {
+                        pgrx::warning!("Failed to set file permissions: {}", e);
+                    } else {
+                        pgrx::info!("Set file permissions to 666 for host access");
+                    }
+                    
+                    // Best-effort chown (may not be available depending on container)
+                    use std::process::Command;
+                    let _ = Command::new("chown").args(&["1000:1000", file_path]).output();
+                    
+                    // Abort indexing after saving, as requested
+                    pgrx::error!(
+                        "ANN samples saved to {} ({} vectors). Aborting index build as requested.",
+                        file_path,
+                        samples.len()
+                    );
+                } else {
+                    // If primary path failed, try alternative locations
+                    let err = write_result.unwrap_err();
+                    pgrx::warning!("Failed to write {}: {}. Trying fallbacks...", file_path, err);
+                    let alt_paths = ["/tmp/ann_samples.npy", "./ann_samples.npy"];
+                    let mut saved_path: Option<&str> = None;
+                    for alt_path in alt_paths {
+                        pgrx::info!("Trying alternative path: {}", alt_path);
+                        match std::fs::write(alt_path, &file_data) {
+                            Ok(_) => {
+                                pgrx::info!("Successfully saved {} samples to {}", samples.len(), alt_path);
+                                saved_path = Some(alt_path);
+                                break;
+                            }
+                            Err(e2) => {
+                                pgrx::warning!("Failed to write {}: {}", alt_path, e2);
+                            }
+                        }
+                    }
+                    // Abort indexing whether we succeeded via a fallback or not
+                    if let Some(path) = saved_path {
+                        pgrx::error!(
+                            "ANN samples saved to {} ({} vectors). Aborting index build as requested.",
+                            path,
+                            samples.len()
+                        );
+                    } else {
+                        pgrx::error!("Failed to write ANN samples to any location. Aborting index build.");
+                    }
+                }
             };
+            
+            // Samples have been saved and process has exited, so this code should never be reached
+            // But if it somehow is, we'll continue with the index build
+            pgrx::info!("Continuing with index build after saving samples");
+            
             reporter.tuples_total(tuples_total);
             // Build once-per-build CTID -> ID map for reliable id resolution
             let heap_relid = unsafe { (*heap.heap_relation).rd_id };
@@ -1232,7 +1353,7 @@ fn make_internal_build_with_tracking(
         
         if num_lists > 1 {
             pgrx::info!(
-                "clustering: starting, using {num_threads} threads, clustering {num_points} vectors of {num_dims} dimension into {num_lists} clusters, in {num_iterations} iterations"
+                "clustering: startingggggggggg22222, using {num_threads} threads, clustering {num_points} vectors of {num_dims} dimension into {num_lists} clusters, in {num_iterations} iterations"
             );
             pgrx::info!(
                 "clustering: training centroids using {} samples",
@@ -1240,6 +1361,54 @@ fn make_internal_build_with_tracking(
             );
         }
         
+        // Dump current input vectors and their corresponding doc/token ids to .npy, then exit
+        use ndarray::Array2;
+        use ndarray_npy::write_npy;
+        let base_dir = std::env::var("VCHORD_DUMP_DIR").unwrap_or_else(|_| "/var/local/VectorChord".to_string());
+        let _ = std::fs::create_dir_all(&base_dir);
+        let vectors_path = format!(
+            "{}/kmeans_input_vectors_w{}_points{}_dims{}.npy",
+            base_dir, num_lists, num_points, num_dims
+        );
+        let ids_path = format!(
+            "{}/kmeans_input_doc_ids_w{}_points{}.npy",
+            base_dir, num_lists, num_points
+        );
+        let mut flat_vectors = Vec::with_capacity(num_points * num_dims);
+        for v in input.iter() {
+            flat_vectors.extend_from_slice(v);
+        }
+        let vectors_array = match Array2::from_shape_vec((num_points, num_dims), flat_vectors) {
+            Ok(a) => a,
+            Err(e) => {
+                pgrx::error!("failed to build ndarray for vectors: {}", e);
+            }
+        };
+        let mut flat_ids = Vec::with_capacity(num_points * 4);
+        for origin in input_origins.iter() {
+            flat_ids.push(origin.0 as u32);
+            flat_ids.push(origin.1 as u32);
+            flat_ids.push(origin.2 as u32);
+            flat_ids.push(origin.3 as u32);
+        }
+        let ids_array = match Array2::from_shape_vec((num_points, 4usize), flat_ids) {
+            Ok(a) => a,
+            Err(e) => {
+                pgrx::error!("failed to build ndarray for ids: {}", e);
+            }
+        };
+        if let Err(e) = write_npy(&vectors_path, &vectors_array) {
+            pgrx::error!("failed to write vectors .npy: {}", e);
+        }
+        if let Err(e) = write_npy(&ids_path, &ids_array) {
+            pgrx::error!("failed to write ids .npy: {}", e);
+        }
+        pgrx::info!("dumped numpy files: {} and {}", vectors_path, ids_path);
+        pgrx::error!(
+            "stopping after dumping k-means input as requested (set by instrumentation)"
+        );
+    
+
         let centroids = k_means::k_means(
             num_threads,
             |i| {
@@ -2117,3 +2286,4 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
         return value;
     }
 }
+

@@ -32,6 +32,8 @@ small_iter = { path = "./crates/small_iter" }
 vchordg = { path = "./crates/vchordg" }
 vchordrq = { path = "./crates/vchordrq" }
 vector = { path = "./crates/vector" }
+ndarray = "0.15"
+ndarray-npy = "0.8"
 
 bumpalo.workspace = true
 half.workspace = true

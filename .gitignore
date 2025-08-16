@@ -4,3 +4,4 @@
 .ignore
 build
 vchord.control
+sql/
