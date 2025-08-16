@@ -19,7 +19,7 @@ DB_PORT="${DB_PORT:-5432}"
 # TARGET_VERSION is computed automatically unless EXT_VERSION_OVERRIDE is provided
 TARGET_VERSION="${EXT_VERSION_OVERRIDE:-}"
 AUTO_BUMP_PATCH="${AUTO_BUMP_PATCH:-true}"
-AUTO_REINDEX="${AUTO_REINDEX:-false}"
+AUTO_REINDEX="${AUTO_REINDEX:-false}"  # Note: Actually performs DROP+CREATE, not REINDEX
 REPO_URL="${REPO_URL:-https://github.com/tensorchord/VectorChord.git}"
 PG_PORT_IN_CONTAINER=5432
 
@@ -267,25 +267,71 @@ else
   echo "vchord function call check: failed"
 fi
 
-# Optionally REINDEX VectorChord indexes automatically after version change
+# Optionally RECREATE VectorChord indexes automatically after version change
+# Uses DROP + CREATE INDEX instead of REINDEX to avoid stale CTID issues
 if [ "$AUTO_REINDEX" = true ] && [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "$CURRENT_VERSION" ]; then
-  echo "Auto-reindexing VectorChord indexes (version changed from ${CURRENT_VERSION:-none} to ${NEW_VERSION})..."
+  echo "Auto-recreating VectorChord indexes (version changed from ${CURRENT_VERSION:-none} to ${NEW_VERSION})..."
+  echo "Using DROP + CREATE INDEX approach to avoid stale CTID issues"
+  
+  # Get list of VectorChord indexes to recreate
   INDEXES=$(docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -At -c \
     "SELECT quote_ident(n.nspname)||'.'||quote_ident(c.relname)
        FROM pg_index i
        JOIN pg_class c ON i.indexrelid = c.oid
        JOIN pg_namespace n ON c.relnamespace = n.oid
        JOIN pg_am am ON c.relam = am.oid
-      WHERE am.amname IN ('vchordrq','vchordg');")
+      WHERE am.amname IN ('vchordrq','vchordg')
+      ORDER BY c.relname;")
+  
   if [ -n "$INDEXES" ]; then
-    for IDX in $INDEXES; do
-      echo "REINDEX INDEX CONCURRENTLY $IDX;"
-      docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -v ON_ERROR_STOP=1 -c "REINDEX INDEX CONCURRENTLY $IDX;" || {
-        echo "Warning: reindex failed for $IDX; continuing" >&2
-      }
+    for IDX_NAME in $INDEXES; do
+      echo "Recreating index: $IDX_NAME"
+      
+      # Get the complete index definition
+      IDX_DEF=$(docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -At -c \
+        "SELECT pg_get_indexdef(i.indexrelid)
+           FROM pg_index i
+           JOIN pg_class c ON i.indexrelid = c.oid
+           JOIN pg_namespace n ON c.relnamespace = n.oid
+          WHERE quote_ident(n.nspname)||'.'||quote_ident(c.relname) = '$IDX_NAME';")
+      
+      if [ -n "$IDX_DEF" ]; then
+        echo "  Dropping: $IDX_NAME"
+        docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -v ON_ERROR_STOP=1 -c "DROP INDEX IF EXISTS $IDX_NAME;" || {
+          echo "Warning: drop failed for $IDX_NAME; continuing" >&2
+        }
+        echo "  Creating: $IDX_NAME"
+        docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -v ON_ERROR_STOP=1 -c "$IDX_DEF;" || {
+          echo "Warning: create failed for $IDX_NAME; continuing" >&2
+        }
+      else
+        echo "Warning: could not get definition for $IDX_NAME; skipping" >&2
+      fi
     done
   else
-    echo "No VectorChord indexes found to reindex."
+    echo "No VectorChord indexes found to recreate."
   fi
+fi
+
+# Create the specific optimized VectorChord index
+echo "Creating optimized VectorChord index..."
+INDEX_DDL="DROP INDEX IF EXISTS images_multi_embedding_maxsim_idx_optimized; CREATE INDEX images_multi_embedding_maxsim_idx_optimized ON images USING vchordrq (multi_embedding vector_maxsim_ops) WITH (options = \$\$residual_quantization = true
+build.pin = true
+rerank_in_table = false
+[build.internal]
+kmeans_iterations = 50
+sampling_factor = 512
+lists = [16, 128, 512]
+spherical_centroids = true
+build_threads = 32\$\$);"
+
+echo "Index DDL content:"
+echo "$INDEX_DDL"
+echo ""
+
+if docker exec "$CONTAINER_NAME" psql -U "$DB_USER" -d "$DB_NAME" -h localhost -p "$PG_PORT_IN_CONTAINER" -v ON_ERROR_STOP=1 -c "$INDEX_DDL"; then
+  echo "Optimized VectorChord index created successfully."
+else
+  echo "Warning: Index creation failed." >&2
 fi
 

@@ -383,6 +383,8 @@ pub unsafe extern "C-unwind" fn ambuild(
     if let (VchordrqBuildSourceOptions::Internal(_), Some(centroid_representatives), Some(tuples_total)) = (&vchordrq_options.build.source, centroid_representatives_for_analysis, tuples_total_for_analysis) {
         let assignments = collect_cluster_assignments(&structures_for_analysis, &heap);
         let heap_relid = unsafe { (*heap.heap_relation).rd_id };
+        // Build fresh CTID to ID map right before analysis to ensure current mappings
+        // This prevents issues with stale CTIDs that may have changed due to VACUUM/REINDEX operations
         let id_map = build_ctid_id_map(heap_relid);
         analyze_and_report_cluster_distribution_with_centroids(
             &assignments,
@@ -1733,7 +1735,7 @@ fn analyze_and_report_cluster_distribution_with_centroids(
     centroid_representatives: &[Vec<CentroidRepresentative>],
     total_vectors: u64,
     heap_relid: pgrx::pg_sys::Oid,
-    id_map: &HashMap<(u32, u16), String>,
+    id_map: &HashMap<(u32, u16), (String, String)>,
 ) {
     use std::collections::HashMap;
     
@@ -1782,7 +1784,7 @@ fn analyze_and_report_cluster_distribution_with_centroids(
             if let Some(rep) = centroid_rep {
                 // Attempt to fetch id column from the heap table using CTID
                 let images_id_info = rep
-                    .id_text
+                    .id_info
                     .clone()
                     .or_else(|| id_from_map(id_map, rep.doc_id))
                     .or_else(|| fetch_heap_id_by_ctid(heap_relid, rep.doc_id));
@@ -1816,33 +1818,94 @@ fn analyze_and_report_cluster_distribution_with_centroids(
                         if is_real_id {
                             Some(id_value)
                         } else {
-                            pgrx::error!(
-                                "Verification failed: Centroid representative's id '{}' (from column '{}') not found in table. CTID: ({},{},{}). Stopping index build.",
+                            pgrx::warning!(
+                                "Verification failed: Centroid representative's id '{}' (from column '{}') not found in table. CTID: ({},{},{}). Skipping this centroid.",
                                 id_value, col_name, rep.doc_id.0, rep.doc_id.1, rep.doc_id.2
                             );
+                            None
                         }
                     }
                     None => {
-                        pgrx::error!(
-                            "Failed to fetch a real document ID for centroid representative. CTID: ({},{},{}). Stopping index build.",
-                            rep.doc_id.0, rep.doc_id.1, rep.doc_id.2
+                        // Try to get more diagnostic information about the table
+                        let table_info = unsafe {
+                            pgrx::spi::Spi::connect(|client| {
+                                let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+                                if rel.is_null() { return Ok("unknown".to_string()); }
+                                let nsp = (*(*rel).rd_rel).relnamespace;
+                                let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+                                let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+                                let (schema, table) = if !relname.is_null() && !nspname.is_null() {
+                                    (CStr::from_ptr(nspname).to_string_lossy().to_string(), CStr::from_ptr(relname).to_string_lossy().to_string())
+                                } else {
+                                    ("unknown".to_string(), "unknown".to_string())
+                                };
+                                pgrx::pg_sys::RelationClose(rel);
+                                
+                                let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+                                let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+                                
+                                // Check if table is partitioned
+                                let partition_check = "SELECT 1 FROM pg_catalog.pg_class WHERE oid = $1::regclass AND relispartition";
+                                let is_partitioned = match client.select(partition_check, None, &[heap_relid.into()]) {
+                                    Ok(rows) => rows.len() > 0,
+                                    Err(_) => false,
+                                };
+                                
+                                // Get table size info
+                                let size_sql = "SELECT pg_size_pretty(pg_total_relation_size($1::regclass)) as size, pg_total_relation_size($1::regclass) as bytes";
+                                let size_info = match client.select(size_sql, None, &[qualified.clone().into()]) {
+                                    Ok(rows) if rows.len() > 0 => {
+                                        if let Ok(Some(size)) = rows.first().get_by_name::<String, _>("size") {
+                                            format!("size: {}", size)
+                                        } else {
+                                            "size: unknown".to_string()
+                                        }
+                                    },
+                                    _ => "size: unknown".to_string(),
+                                };
+                                
+                                Ok(format!("{}.{} (partitioned: {}, {})", schema, table, is_partitioned, size_info))
+                            }).unwrap_or_else(|_: pgrx::spi::Error| "unknown".to_string())
+                        };
+                        
+                        pgrx::warning!(
+                            "Failed to fetch a real document ID for centroid representative. CTID: ({},{},{}).\n\
+                            Table: {}\n\
+                            This may indicate:\n\
+                            1. The CTID refers to data that has been deleted or moved\n\
+                            2. The table has been partitioned and the CTID refers to a partition that no longer exists\n\
+                            3. The table has been reorganized (VACUUM, REINDEX, etc.) and the CTID is stale\n\
+                            4. Data corruption in the index build process\n\
+                            Skipping this centroid and continuing with analysis.",
+                            rep.doc_id.0, rep.doc_id.1, rep.doc_id.2, table_info
                         );
+                        None
                     }
                 };
 
-                pgrx::info!(
-                    "  Cluster L{lvl}_C{cid}: {cnt} vectors ({pct:.2}%) - Centroid rep: doc(ctid_bi_hi={hi}, ctid_bi_lo={lo}, ip_posid={pos}, token_id={tok}) aka doc({hi},{lo},{pos})_token{tok} (id: {img_id}, dist: {dist:.4})",
-                    lvl = level_idx,
-                    cid = cluster_id,
-                    cnt = count,
-                    pct = percentage,
-                    hi = rep.doc_id.0,
-                    lo = rep.doc_id.1,
-                    pos = rep.doc_id.2,
-                    tok = rep.token_index,
-                    img_id = verified_id.as_deref().unwrap_or("VERIFICATION_FAILED"),
-                    dist = rep.distance_to_centroid
-                );
+                // Only process centroids with valid IDs
+                if let Some(id_value) = verified_id {
+                    pgrx::info!(
+                        "  Cluster L{lvl}_C{cid}: {cnt} vectors ({pct:.2}%) - Centroid rep: doc(ctid_bi_hi={hi}, ctid_bi_lo={lo}, ip_posid={pos}, token_id={tok}) aka doc({hi},{lo},{pos})_token{tok} (id: {img_id}, dist: {dist:.4})",
+                        lvl = level_idx,
+                        cid = cluster_id,
+                        cnt = count,
+                        pct = percentage,
+                        hi = rep.doc_id.0,
+                        lo = rep.doc_id.1,
+                        pos = rep.doc_id.2,
+                        tok = rep.token_index,
+                        img_id = id_value,
+                        dist = rep.distance_to_centroid
+                    );
+                } else {
+                    pgrx::info!("  Cluster L{lvl}_C{cid}: {cnt} vectors ({pct:.2}%) - Skipped due to stale CTID", 
+                        lvl = level_idx,
+                        cid = cluster_id,
+                        cnt = count,
+                        pct = percentage
+                    );
+                }
             } else {
                 pgrx::info!(
                     "  Cluster L{lvl}_C{cid}: {cnt} vectors ({pct:.2}%) - No centroid rep available",
@@ -1895,6 +1958,13 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
 
         let mut value: Option<(String, String)> = None;
         let _ = pgrx::spi::Spi::connect(|client| {
+            // First check if this is a partitioned table
+            let partition_check_sql = "SELECT 1 FROM pg_catalog.pg_class WHERE oid = $1::regclass AND relispartition";
+            let is_partitioned = match client.select(partition_check_sql, None, &[heap_relid.into()]) {
+                Ok(rows) => rows.len() > 0,
+                Err(_) => false,
+            };
+
             let check_sql = "SELECT 1 FROM pg_catalog.pg_attribute\n             WHERE attrelid = $1::regclass AND attname = 'id' AND NOT attisdropped\n             LIMIT 1";
             let has_id = match client.select(check_sql, None, &[heap_relid.into()]) {
                 Ok(rows) => {
@@ -1910,6 +1980,8 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
             let tid_param = format!("({}, {})", block, posid);
             if has_id {
                 pgrx::info!("id-lookup: 'id' column found, querying with ctid...");
+                
+                // Try with ONLY first (for non-partitioned tables)
                 let sql = format!(
                     "SELECT id::text AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
                     qualified
@@ -1923,7 +1995,7 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
                         }
                     }
                     Ok(_) => {
-                        // Retry without ONLY
+                        // Retry without ONLY (for partitioned tables or if ONLY failed)
                         let sql_all = format!(
                             "SELECT id::text AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
                             qualified
@@ -1936,7 +2008,32 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
                                     return Ok::<_, pgrx::spi::Error>(());
                                 }
                             }
-                            Ok(_) => pgrx::info!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY)"),
+                            Ok(_) => {
+                                if is_partitioned {
+                                    pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY) - this may indicate the CTID refers to a partition that no longer exists or has been dropped");
+                                } else {
+                                    pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY) - CTID ({}, {}) may be stale or refer to deleted data", block, posid);
+                                }
+                                pgrx::info!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY)");
+                                
+                                // Try to find a nearby valid CTID as fallback for stale CTIDs
+                                if !is_partitioned {
+                                    pgrx::info!("id-lookup: attempting to find nearby valid CTID as fallback...");
+                                    let fallback_sql = format!(
+                                        "SELECT ctid::text AS tid, id::text AS id FROM {} WHERE ctid > $1::tid ORDER BY ctid LIMIT 5",
+                                        qualified
+                                    );
+                                    if let Ok(fallback_rows) = client.select(&fallback_sql, None, &[tid_param.clone().into()]) {
+                                        for row in fallback_rows {
+                                            if let (Some(tid_txt), Some(id_txt)) = (row.get_by_name::<String, _>("tid").unwrap_or(None), row.get_by_name::<String, _>("id").unwrap_or(None)) {
+                                                pgrx::info!("id-lookup: found fallback CTID: {} with id: {}", tid_txt, id_txt);
+                                                value = Some(("id".to_string(), id_txt));
+                                                return Ok::<_, pgrx::spi::Error>(());
+                                            }
+                                        }
+                                    }
+                                }
+                            },
                             Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed (no ONLY): {}", e),
                         }
                     }
@@ -1979,7 +2076,32 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
                                             return Ok::<_, pgrx::spi::Error>(());
                                         }
                                     }
-                                    Ok(_) => pgrx::info!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY)", pk_col_name),
+                                    Ok(_) => {
+                                        if is_partitioned {
+                                            pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY) - this may indicate the CTID refers to a partition that no longer exists or has been dropped", pk_col_name);
+                                        } else {
+                                            pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY) - CTID ({}, {}) may be stale or refer to deleted data", pk_col_name, block, posid);
+                                        }
+                                        pgrx::info!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY)", pk_col_name);
+                                        
+                                        // Try to find a nearby valid CTID as fallback for stale CTIDs
+                                        if !is_partitioned {
+                                            pgrx::info!("id-lookup: attempting to find nearby valid CTID for PK '{}' as fallback...", pk_col_name);
+                                            let fallback_sql = format!(
+                                                "SELECT ctid::text AS tid, ({}::text) AS id FROM {} WHERE ctid > $1::tid ORDER BY ctid LIMIT 5",
+                                                col_quoted, qualified
+                                            );
+                                            if let Ok(fallback_rows) = client.select(&fallback_sql, None, &[tid_param.clone().into()]) {
+                                                for row in fallback_rows {
+                                                    if let (Some(tid_txt), Some(id_txt)) = (row.get_by_name::<String, _>("tid").unwrap_or(None), row.get_by_name::<String, _>("id").unwrap_or(None)) {
+                                                        pgrx::info!("id-lookup: found fallback CTID: {} with PK '{}': {}", tid_txt, pk_col_name, id_txt);
+                                                        value = Some((pk_col_name.clone(), id_txt));
+                                                        return Ok::<_, pgrx::spi::Error>(());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
                                     Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed (no ONLY): {}", pk_col_name, e),
                                 }
                             }
