@@ -1,58 +1,157 @@
-## Run External Index Precomputation Toolkit
+# VectorChord Scripts
 
-1. Install requirements
+This directory contains the reorganized build and installation scripts for VectorChord.
 
-```shell
-# PYTHON = 3.11
-# When using CPU to train k-means clustering
-conda install conda-forge::pgvector-python numpy pytorch::faiss-cpu conda-forge::psycopg h5py tqdm
-# or
-pip install pgvector numpy faiss-cpu psycopg h5py tqdm
+## Script Overview
 
-# When using GPU to train k-means clustering
-conda install conda-forge::pgvector-python numpy pytorch::faiss-gpu conda-forge::psycopg h5py tqdm
+### Build Scripts
+
+#### `app.sh` - Main Application Script
+- **Purpose**: Main entry point that chooses between incremental and clean builds
+- **Usage**: `./scripts/app.sh`
+- **Environment Variables**:
+  - `CLEAN_BUILD`: Force clean build (default: false)
+  - `FORCE_REBUILD`: Force rebuild even if unchanged (default: false)
+  - `USE_INCREMENTAL`: Enable incremental builds (default: true)
+  - `PERSISTENT_BUILDER`: Use persistent build container (default: true)
+
+#### `build_incremental.sh` - Incremental Build Script
+- **Purpose**: Performs incremental builds with dependency checking and caching
+- **Usage**: `./scripts/build_incremental.sh`
+- **Features**:
+  - Dependency change detection
+  - Persistent build containers
+  - Cargo incremental compilation
+  - Target directory reuse
+
+#### `build_clean.sh` - Clean Build Script
+- **Purpose**: Always performs a fresh build without caching
+- **Usage**: `./scripts/build_clean.sh`
+- **Features**:
+  - Always cleans target directory
+  - Disables incremental compilation
+  - Fresh dependency resolution
+
+### Installation and Management Scripts
+
+#### `install_extension.sh` - Extension Installation
+- **Purpose**: Installs the built extension into PostgreSQL containers
+- **Usage**: `./scripts/install_extension.sh`
+- **Features**:
+  - Extension deployment
+  - Container restart management
+  - Version management
+  - GLIBC compatibility checking
+
+#### `rebuild_indices.sh` - Index Management
+- **Purpose**: Rebuilds VectorChord indices after extension updates
+- **Usage**: `./scripts/rebuild_indices.sh`
+- **Features**:
+  - Index recreation (DROP + CREATE)
+  - Optimized index creation
+  - Extension verification
+
+#### `build_builder_image.sh` - Docker Image Builder
+- **Purpose**: Creates the builder Docker image
+- **Usage**: `./scripts/build_builder_image.sh`
+- **Features**:
+  - Rust toolchain installation
+  - PostgreSQL development packages
+  - Builder user setup
+
+## Usage Examples
+
+### Basic Incremental Build
+```bash
+./scripts/app.sh
 ```
 
-1. Prepare dataset in `hdf5` format
+### Force Clean Build
+```bash
+CLEAN_BUILD=true ./scripts/app.sh
+```
 
-   - If you already have your vectors stored in `PostgreSQL` using `pgvector`, you can export them to a local file by:
-     ```shell
-     python script/dump.py -n [table name] -c [column name] -d [dim] -o export.hdf5
-     ```
+### Force Rebuild
+```bash
+FORCE_REBUILD=true ./scripts/app.sh
+```
 
-   - If you don't have any data, but would like to give it a try, you can choose one of these datasets:
+### Disable Incremental Builds
+```bash
+USE_INCREMENTAL=false ./scripts/app.sh
+```
 
-     ```shell
-     wget http://ann-benchmarks.com/sift-128-euclidean.hdf5 # num=1M dim=128 metric=l2
-     wget http://ann-benchmarks.com/gist-960-euclidean.hdf5 # num=1M dim=960 metric=l2
-     wget https://myscale-datasets.s3.ap-southeast-1.amazonaws.com/laion-5m-test-ip.hdf5 # num=5M dim=768 metric=dot
-     wget https://myscale-datasets.s3.ap-southeast-1.amazonaws.com/laion-20m-test-ip.hdf5 # num=20M dim=768 metric=dot
-     wget https://myscale-datasets.s3.ap-southeast-1.amazonaws.com/laion-100m-test-ip.hdf5 # num=100M dim=768 metric=dot
-     ```
+### Use Temporary Build Containers
+```bash
+PERSISTENT_BUILDER=false ./scripts/app.sh
+```
 
-2. Preform clustering of centroids from vectors
+### Full Installation Workflow
+```bash
+# 1. Build the extension
+./scripts/app.sh
 
-   ```shell
-   # For small dataset size from 1M to 5M
-   python script/train.py -i [dataset file(export.hdf5)] -o [centroid filename(centroid.npy)] -lists [lists] -m [metric(l2/cos/dot)]
-   # For large datasets size, 5M to 100M in size, use GPU and mmap chunks
-   python script/train.py -i [dataset file(export.hdf5)] -o [centroid filename(centroid.npy)] --lists [lists] -m [metric(l2/cos/dot)] -g --mmap
-   ```
+# 2. Install into PostgreSQL container
+./scripts/install_extension.sh
 
-   `lists` is the number of centroids for clustering, and a typical value for large datasets(>5M) could range from:
-   
-   $$
-   4*\sqrt{len(vectors)} \le lists \le 16*\sqrt{len(vectors)}
-   $$
+# 3. Rebuild indices (optional)
+AUTO_REINDEX=true ./scripts/rebuild_indices.sh
+```
 
-3. To insert vectors and centroids into the database, and then create an index 
+## Script Dependencies
 
-   ```shell
-   python script/index.py -n [table name] -i [dataset file(export.hdf5)] -c [centroid filename(centroid.npy)] -m [metric(l2/cos/dot)] -d [dim] --url postgresql://postgres:123@localhost:5432/postgres
-   ```
+- **Docker**: Required for build containers
+- **Builder Image**: Must be built first using `build_builder_image.sh`
+- **PostgreSQL Container**: Must be running for installation scripts
 
-4. Let's start our tour to check the benchmark result of VectorChord
+## Environment Variables
 
-   ```shell
-   python script/bench.py -n [table name] -i [dataset file(export.hdf5)] -m [metric(l2/cos/dot)] --nprob 100 --epsilon 1.0  --url postgresql://postgres:123@localhost:5432/postgres
-   ```
+### Build Configuration
+- `CLEAN_BUILD`: Force clean build
+- `FORCE_REBUILD`: Force rebuild regardless of changes
+- `USE_INCREMENTAL`: Enable/disable incremental builds
+- `PERSISTENT_BUILDER`: Use persistent vs temporary build containers
+
+### Database Configuration
+- `CONTAINER_NAME`: PostgreSQL container name
+- `DB_NAME`: Database name
+- `DB_USER`: Database user
+- `DB_PASSWORD`: Database password
+- `DB_PORT`: Database port
+
+### Build Container Configuration
+- `BUILDER_IMAGE`: Docker image for building
+- `BUILD_CONTAINER`: Build container name
+- `JOBS`: Number of parallel build jobs
+
+## Architecture
+
+The new script structure separates concerns:
+
+1. **Build Logic**: Handled by `app.sh`, `build_incremental.sh`, and `build_clean.sh`
+2. **Installation Logic**: Handled by `install_extension.sh`
+3. **Index Management**: Handled by `rebuild_indices.sh`
+4. **Infrastructure**: Handled by `build_builder_image.sh`
+
+This separation allows for:
+- Independent testing of each component
+- Easier maintenance and debugging
+- Flexible workflow combinations
+- Better error isolation
+
+## Troubleshooting
+
+### Build Issues
+- Ensure builder image exists: `./scripts/build_builder_image.sh`
+- Check Docker daemon is running
+- Verify sufficient disk space for builds
+
+### Installation Issues
+- Ensure PostgreSQL container is running
+- Check database connection credentials
+- Verify extension binary compatibility
+
+### Index Issues
+- Ensure extension is properly installed
+- Check database permissions
+- Verify table structure

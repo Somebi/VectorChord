@@ -1,0 +1,51 @@
+# Build container for VectorChord PostgreSQL extension
+# Uses the official VectorChord PostgreSQL image as base to ensure compatibility
+FROM ghcr.io/tensorchord/vchord-postgres:pg17-v0.5.0
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUSTUP_INIT_SKIP_PATH_CHECK=yes
+ENV PATH="/root/.cargo/bin:$PATH"
+
+# Install build dependencies (PostgreSQL dev packages are already available)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        ca-certificates \
+        pkg-config \
+        git \
+        clang \
+        libclang-dev \
+        postgresql-server-dev-17 \
+        && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /build
+
+# Create cargo cache volume mount points for better dependency caching
+RUN mkdir -p /home/builder/.cargo/registry /home/builder/.cargo/git /home/builder/.cargo/bin
+
+# Create a non-root user for building (optional, for security)
+RUN useradd -m -s /bin/bash builder && \
+    chown -R builder:builder /build /home/builder
+
+# Install Rust toolchain for the builder user
+USER builder
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    . /home/builder/.cargo/env && \
+    rustup toolchain install stable && \
+    rustup default stable && \
+    rustup target add x86_64-unknown-linux-gnu
+
+# Set cargo home for the builder user
+ENV CARGO_HOME=/home/builder/.cargo
+ENV PATH="/home/builder/.cargo/bin:$PATH"
+
+# Ensure target directory exists and is owned by builder
+RUN mkdir -p /build/target
+
+# Default command - will be overridden by the build script
+CMD ["/bin/bash"]

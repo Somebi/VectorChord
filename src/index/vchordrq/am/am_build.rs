@@ -327,6 +327,11 @@ pub unsafe extern "C-unwind" fn ambuild(
                 let mut samples = Vec::new();
                 let mut sample_origins = Vec::new(); // Track origin and resolved id
                 let mut number_of_samples = 0_u32;
+                
+                // Build CTID to ID map for reliable ID resolution during sampling
+                let heap_relid = unsafe { (*heap.heap_relation).rd_id };
+                let id_map = build_ctid_id_map(heap_relid);
+                
                 heap.traverse(false, |(ctid, store)| {
                     for (vector, extra) in store {
                         let x = match vector {
@@ -338,18 +343,19 @@ pub unsafe extern "C-unwind" fn ambuild(
                             x.len() as u32,
                             "invalid vector dimensions"
                         );
+                        
+                        let [bi_hi, bi_lo, ip_posid] = ctid_to_key(ctid);
+                        // Resolve document ID immediately during sampling for reliable tracking
+                        let validated_doc_id_info = id_map.get(&(bi_hi as u32, bi_lo)).cloned();
+                        
                         if number_of_samples < max_number_of_samples {
                             samples.push(x);
-                            let key = ctid_to_key(ctid);
-                            // Do NOT fetch id here; only resolve for chosen centroid representatives later
-                            sample_origins.push((key[0], key[1], key[2], extra, None::<(String, String)>));
+                            sample_origins.push((bi_hi, bi_lo, ip_posid, extra, validated_doc_id_info));
                             number_of_samples += 1;
                         } else {
                             let index = rand.random_range(0..max_number_of_samples) as usize;
                             samples[index] = x;
-                            let key = ctid_to_key(ctid);
-                            // Do NOT fetch id here; only resolve for chosen centroid representatives later
-                            sample_origins[index] = (key[0], key[1], key[2], extra, None::<(String, String)>);
+                            sample_origins[index] = (bi_hi, bi_lo, ip_posid, extra, validated_doc_id_info);
                         }
                     }
                     tuples_total += 1;
@@ -364,45 +370,48 @@ pub unsafe extern "C-unwind" fn ambuild(
                 // Save samples to file and exit
                 pgrx::info!("saving {} samples to ann_samples.npy", samples.len());
                 
-                // Convert samples to raw bytes for numpy compatibility
-                let mut file_data = Vec::new();
+                // Convert samples to ndarray for easy .npy writing
+                use ndarray::Array2;
+                use ndarray_npy::write_npy;
                 
-                // Write numpy .npy header
-                // Magic string
-                file_data.extend_from_slice(b"\x93NUMPY");
-                // Version
-                file_data.extend_from_slice(b"\x01\x00");
-                
-                // Header length (will be filled later)
-                let header_start = file_data.len();
-                file_data.extend_from_slice(b"\x00\x00");
-                
-                // Header content
-                let shape_str = format!("({}, {})", samples.len(), vector_options.dims);
-                let dtype_str = "<f4"; // little-endian float32
-                let header = format!("{{'descr': '{}', 'fortran_order': False, 'shape': {}}}", dtype_str, shape_str);
-                
-                // Pad header to be divisible by 16
-                let header_bytes = header.as_bytes();
-                let header_len = header_bytes.len();
-                let padding_needed = (16 - (header_len % 16)) % 16;
-                let total_header_len = header_len + padding_needed;
-                
-                // Write header
-                file_data.extend_from_slice(header_bytes);
-                for _ in 0..padding_needed {
-                    file_data.push(b' ');
+                // Flatten the samples into a single vector
+                let dims = vector_options.dims as usize;
+                let mut flat_samples = Vec::with_capacity(samples.len() * dims);
+                for sample in &samples {
+                    flat_samples.extend_from_slice(sample);
                 }
                 
-                // Update header length
-                let header_len_bytes = (total_header_len as u16).to_le_bytes();
-                file_data[header_start..header_start + 2].copy_from_slice(&header_len_bytes);
-                
-                // Write sample data
-                for sample in &samples {
-                    for &value in sample {
-                        file_data.extend_from_slice(&value.to_le_bytes());
+                // Create ndarray from flattened data
+                let samples_array = match Array2::from_shape_vec((samples.len(), dims), flat_samples) {
+                    Ok(array) => array,
+                    Err(e) => {
+                        pgrx::error!("Failed to create ndarray from samples: {}", e);
+                        // Since this function has a return type, we need to continue and let the error propagate
+                        // The error logging above will help with debugging
+                        // Note: This return is unreachable due to pgrx::error! behavior
+                        return std::ptr::null_mut();
                     }
+                };
+                
+                // Save metadata for analysis
+                let mut metadata_rows = Vec::with_capacity(samples.len());
+                for (bi_hi, bi_lo, ip_posid, extra, doc_id_info) in &sample_origins {
+                    let doc_id = if let Some((id, _table_name)) = doc_id_info {
+                        id.clone()
+                    } else {
+                        format!("ctid_{}_{}_{}", bi_hi, bi_lo, ip_posid)
+                    };
+                    let table_name = if let Some((_, table_name)) = doc_id_info {
+                        table_name.clone()
+                    } else {
+                        "unknown".to_string()
+                    };
+                    metadata_rows.push(format!("{}|{}|{}_{}_{}|{}", 
+                        doc_id, 
+                        table_name, 
+                        bi_hi, bi_lo, ip_posid, 
+                        extra
+                    ));
                 }
                 
                 // Get current working directory for debugging
@@ -411,12 +420,17 @@ pub unsafe extern "C-unwind" fn ambuild(
                 
                 // Write to the shared directory that's mounted from host
                 let file_path = "/var/local/postgres_shared/ann_samples.npy";
-                pgrx::info!("Attempting to write to: {}", file_path);
+                let metadata_file_path = "/var/local/postgres_shared/ann_samples_metadata.txt";
+                pgrx::info!("Attempting to write to: {} and {}", file_path, metadata_file_path);
                 
                 // Try to write to the primary location first
-                let write_result = std::fs::write(file_path, &file_data);
-                if write_result.is_ok() {
+                let write_result = write_npy(file_path, &samples_array);
+                let metadata_write_result = std::fs::write(metadata_file_path, metadata_rows.join("\n"));
+                
+                if write_result.is_ok() && metadata_write_result.is_ok() {
                     pgrx::info!("Successfully saved {} samples to {}", samples.len(), file_path);
+                    pgrx::info!("Successfully saved metadata to {}", metadata_file_path);
+                    pgrx::info!("Metadata format: doc_id|table_name|ctid_bi_hi_bi_lo_posid|token_index");
                     
                     // Relax permissions so host can read
                     use std::os::unix::fs::PermissionsExt;
@@ -425,43 +439,68 @@ pub unsafe extern "C-unwind" fn ambuild(
                     } else {
                         pgrx::info!("Set file permissions to 666 for host access");
                     }
+                    if let Err(e) = std::fs::set_permissions(metadata_file_path, std::fs::Permissions::from_mode(0o666)) {
+                        pgrx::warning!("Failed to set metadata file permissions: {}", e);
+                    } else {
+                        pgrx::info!("Set metadata file permissions to 666 for host access");
+                    }
                     
                     // Best-effort chown (may not be available depending on container)
                     use std::process::Command;
                     let _ = Command::new("chown").args(&["1000:1000", file_path]).output();
+                    let _ = Command::new("chown").args(&["1000:1000", metadata_file_path]).output();
                     
                     // Abort indexing after saving, as requested
                     pgrx::error!(
-                        "ANN samples saved to {} ({} vectors). Aborting index build as requested.",
-                        file_path,
-                        samples.len()
+                        "ANN samples saved to {} and metadata to {} ({} vectors). Aborting index build as requested.",
+                        file_path, metadata_file_path, samples.len()
                     );
                 } else {
                     // If primary path failed, try alternative locations
                     let err = write_result.unwrap_err();
-                    pgrx::warning!("Failed to write {}: {}. Trying fallbacks...", file_path, err);
+                    let metadata_err = metadata_write_result.unwrap_err();
+                    pgrx::warning!("Failed to write {}: {}. Failed to write metadata: {}. Trying fallbacks...", file_path, err, metadata_err);
+                    
                     let alt_paths = ["/tmp/ann_samples.npy", "./ann_samples.npy"];
+                    let alt_metadata_paths = ["/tmp/ann_samples_metadata.txt", "./ann_samples_metadata.txt"];
                     let mut saved_path: Option<&str> = None;
-                    for alt_path in alt_paths {
-                        pgrx::info!("Trying alternative path: {}", alt_path);
-                        match std::fs::write(alt_path, &file_data) {
-                            Ok(_) => {
-                                pgrx::info!("Successfully saved {} samples to {}", samples.len(), alt_path);
-                                saved_path = Some(alt_path);
-                                break;
+                    let mut saved_metadata_path: Option<&str> = None;
+                    
+                    for (alt_path, alt_metadata_path) in alt_paths.iter().zip(alt_metadata_paths.iter()) {
+                        pgrx::info!("Trying alternative paths: {} and {}", alt_path, alt_metadata_path);
+                        
+                        let samples_result = write_npy(alt_path, &samples_array);
+                        let metadata_result = std::fs::write(alt_metadata_path, metadata_rows.join("\n"));
+                        
+                        if samples_result.is_ok() && metadata_result.is_ok() {
+                            pgrx::info!("Successfully saved {} samples to {}", samples.len(), alt_path);
+                            pgrx::info!("Successfully saved metadata to {}", alt_metadata_path);
+                            saved_path = Some(*alt_path);
+                            saved_metadata_path = Some(*alt_metadata_path);
+                            break;
+                        } else {
+                            if let Err(e) = samples_result {
+                                pgrx::warning!("Failed to write {}: {}", alt_path, e);
                             }
-                            Err(e2) => {
-                                pgrx::warning!("Failed to write {}: {}", alt_path, e2);
+                            if let Err(e) = metadata_result {
+                                pgrx::warning!("Failed to write {}: {}", alt_metadata_path, e);
                             }
                         }
                     }
+                    
                     // Abort indexing whether we succeeded via a fallback or not
                     if let Some(path) = saved_path {
-                        pgrx::error!(
-                            "ANN samples saved to {} ({} vectors). Aborting index build as requested.",
-                            path,
-                            samples.len()
-                        );
+                        if let Some(metadata_path) = saved_metadata_path {
+                            pgrx::error!(
+                                "ANN samples saved to {} and metadata to {} ({} vectors). Aborting index build as requested.",
+                                path, metadata_path, samples.len()
+                            );
+                        } else {
+                            pgrx::error!(
+                                "ANN samples saved to {} but metadata failed ({} vectors). Aborting index build as requested.",
+                                path, samples.len()
+                            );
+                        }
                     } else {
                         pgrx::error!("Failed to write ANN samples to any location. Aborting index build.");
                     }
@@ -1374,6 +1413,11 @@ fn make_internal_build_with_tracking(
             "{}/kmeans_input_doc_ids_w{}_points{}.npy",
             base_dir, num_lists, num_points
         );
+        let _metadata_path = format!(
+            "{}/kmeans_input_metadata_w{}_points{}.npy",
+            base_dir, num_lists, num_points
+        );
+        
         let mut flat_vectors = Vec::with_capacity(num_points * num_dims);
         for v in input.iter() {
             flat_vectors.extend_from_slice(v);
@@ -1384,12 +1428,14 @@ fn make_internal_build_with_tracking(
                 pgrx::error!("failed to build ndarray for vectors: {}", e);
             }
         };
+        
+        // Save CTID components and token indices
         let mut flat_ids = Vec::with_capacity(num_points * 4);
-        for origin in input_origins.iter() {
-            flat_ids.push(origin.0 as u32);
-            flat_ids.push(origin.1 as u32);
-            flat_ids.push(origin.2 as u32);
-            flat_ids.push(origin.3 as u32);
+        for (bi_hi, bi_lo, ip_posid, extra, _doc_id_info) in input_origins.iter() {
+            flat_ids.push(*bi_hi as u32);
+            flat_ids.push(*bi_lo as u32);
+            flat_ids.push(*ip_posid as u32);
+            flat_ids.push(*extra as u32);
         }
         let ids_array = match Array2::from_shape_vec((num_points, 4usize), flat_ids) {
             Ok(a) => a,
@@ -1397,6 +1443,40 @@ fn make_internal_build_with_tracking(
                 pgrx::error!("failed to build ndarray for ids: {}", e);
             }
         };
+        
+        // Save document IDs and metadata for analysis
+        let mut doc_ids = Vec::with_capacity(num_points);
+        let mut table_names = Vec::with_capacity(num_points);
+        for (bi_hi, bi_lo, ip_posid, _extra, doc_id_info) in input_origins.iter() {
+            if let Some((doc_id, table_name)) = doc_id_info {
+                doc_ids.push(doc_id.clone());
+                table_names.push(table_name.clone());
+            } else {
+                // Fallback to CTID-based identifier if document ID couldn't be resolved
+                doc_ids.push(format!("ctid_{}_{}_{}", bi_hi, bi_lo, ip_posid));
+                table_names.push("unknown".to_string());
+            }
+        }
+        
+        // Save metadata as structured data (doc_id, table_name, ctid_components, token_index)
+        let mut metadata_rows = Vec::with_capacity(num_points);
+        for (i, (bi_hi, bi_lo, ip_posid, extra, _doc_id_info)) in input_origins.iter().enumerate() {
+            metadata_rows.push(format!("{}|{}|{}_{}_{}|{}", 
+                doc_ids[i], 
+                table_names[i], 
+                bi_hi, bi_lo, ip_posid, 
+                extra
+            ));
+        }
+        
+        // Write metadata to a separate text file for easy analysis
+        let metadata_text_path = format!(
+            "{}/kmeans_input_metadata_w{}_points{}.txt",
+            base_dir, num_lists, num_points
+        );
+        if let Err(e) = std::fs::write(&metadata_text_path, metadata_rows.join("\n")) {
+            pgrx::error!("failed to write metadata text file: {}", e);
+        }
         if let Err(e) = write_npy(&vectors_path, &vectors_array) {
             pgrx::error!("failed to write vectors .npy: {}", e);
         }
@@ -1404,10 +1484,14 @@ fn make_internal_build_with_tracking(
             pgrx::error!("failed to write ids .npy: {}", e);
         }
         pgrx::info!("dumped numpy files: {} and {}", vectors_path, ids_path);
+        pgrx::info!("dumped metadata file: {}", metadata_text_path);
+        pgrx::info!("metadata format: doc_id|table_name|ctid_bi_hi_bi_lo_posid|token_index");
         pgrx::error!(
             "stopping after dumping k-means input as requested (set by instrumentation)"
         );
-    
+        
+        // Note: The following code is unreachable due to pgrx::error! behavior
+        // but is kept for completeness and potential future use
 
         let centroids = k_means::k_means(
             num_threads,
@@ -1440,17 +1524,24 @@ fn make_internal_build_with_tracking(
                 let distance = f32::reduce_sum_of_d2(input_vector, centroid);
                 if distance < best_distance {
                     best_distance = distance;
-                    let origin = input_origins[input_idx].clone();
-                    let doc_id = (origin.0, origin.1, origin.2);
+                    let (bi_hi, bi_lo, ip_posid, extra, doc_id_info) = input_origins[input_idx].clone();
+                    let doc_id = (bi_hi, bi_lo, ip_posid);
+                    
                     // Resolve id from map first, then fallback
-                    let id_info = origin
-                        .4
+                    let id_info = doc_id_info
                         .clone()
-                        .or_else(|| id_from_map(id_map, doc_id))
-                        .or_else(|| fetch_heap_id_by_ctid(heap_relid_for_ids, doc_id));
+                        .or_else(|| id_from_map(id_map, doc_id));
+                    
+                    // Try to refresh stale CTID if we have valid ID info
+                    let refreshed_doc_id = if let Some(ref id_info) = id_info {
+                        refresh_stale_ctid(heap_relid_for_ids, doc_id, &Some(id_info.clone())).unwrap_or(doc_id)
+                    } else {
+                        doc_id
+                    };
+                    
                     best_representative = Some(CentroidRepresentative {
-                        doc_id,
-                        token_index: origin.3,
+                        doc_id: refreshed_doc_id,
+                        token_index: extra,
                         distance_to_centroid: distance,
                         id_info,
                     });
@@ -1952,11 +2043,17 @@ fn analyze_and_report_cluster_distribution_with_centroids(
         for (cluster_id, count, percentage, centroid_rep) in entries {
             if let Some(rep) = centroid_rep {
                 // Attempt to fetch id column from the heap table using CTID
+                // First try to refresh stale CTID if we have valid ID info
+                let refreshed_doc_id = if let Some(ref id_info) = rep.id_info {
+                    refresh_stale_ctid(heap_relid, rep.doc_id, &Some(id_info.clone())).unwrap_or(rep.doc_id)
+                } else {
+                    rep.doc_id
+                };
+                
                 let images_id_info = rep
                     .id_info
                     .clone()
-                    .or_else(|| id_from_map(id_map, rep.doc_id))
-                    .or_else(|| fetch_heap_id_by_ctid(heap_relid, rep.doc_id));
+                    .or_else(|| id_from_map(id_map, refreshed_doc_id));
 
                 let verified_id = match images_id_info {
                     Some((col_name, id_value)) => {
@@ -2184,24 +2281,6 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
                                     pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY) - CTID ({}, {}) may be stale or refer to deleted data", block, posid);
                                 }
                                 pgrx::info!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY)");
-                                
-                                // Try to find a nearby valid CTID as fallback for stale CTIDs
-                                if !is_partitioned {
-                                    pgrx::info!("id-lookup: attempting to find nearby valid CTID as fallback...");
-                                    let fallback_sql = format!(
-                                        "SELECT ctid::text AS tid, id::text AS id FROM {} WHERE ctid > $1::tid ORDER BY ctid LIMIT 5",
-                                        qualified
-                                    );
-                                    if let Ok(fallback_rows) = client.select(&fallback_sql, None, &[tid_param.clone().into()]) {
-                                        for row in fallback_rows {
-                                            if let (Some(tid_txt), Some(id_txt)) = (row.get_by_name::<String, _>("tid").unwrap_or(None), row.get_by_name::<String, _>("id").unwrap_or(None)) {
-                                                pgrx::info!("id-lookup: found fallback CTID: {} with id: {}", tid_txt, id_txt);
-                                                value = Some(("id".to_string(), id_txt));
-                                                return Ok::<_, pgrx::spi::Error>(());
-                                            }
-                                        }
-                                    }
-                                }
                             },
                             Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed (no ONLY): {}", e),
                         }
@@ -2252,24 +2331,6 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
                                             pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY) - CTID ({}, {}) may be stale or refer to deleted data", pk_col_name, block, posid);
                                         }
                                         pgrx::info!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY)", pk_col_name);
-                                        
-                                        // Try to find a nearby valid CTID as fallback for stale CTIDs
-                                        if !is_partitioned {
-                                            pgrx::info!("id-lookup: attempting to find nearby valid CTID for PK '{}' as fallback...", pk_col_name);
-                                            let fallback_sql = format!(
-                                                "SELECT ctid::text AS tid, ({}::text) AS id FROM {} WHERE ctid > $1::tid ORDER BY ctid LIMIT 5",
-                                                col_quoted, qualified
-                                            );
-                                            if let Ok(fallback_rows) = client.select(&fallback_sql, None, &[tid_param.clone().into()]) {
-                                                for row in fallback_rows {
-                                                    if let (Some(tid_txt), Some(id_txt)) = (row.get_by_name::<String, _>("tid").unwrap_or(None), row.get_by_name::<String, _>("id").unwrap_or(None)) {
-                                                        pgrx::info!("id-lookup: found fallback CTID: {} with PK '{}': {}", tid_txt, pk_col_name, id_txt);
-                                                        value = Some((pk_col_name.clone(), id_txt));
-                                                        return Ok::<_, pgrx::spi::Error>(());
-                                                    }
-                                                }
-                                            }
-                                        }
                                     },
                                     Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed (no ONLY): {}", pk_col_name, e),
                                 }
@@ -2285,5 +2346,161 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
         });
         return value;
     }
+}
+
+// Add this function after the fetch_heap_id_by_ctid function
+fn refresh_stale_ctid(
+    heap_relid: pgrx::pg_sys::Oid,
+    stale_ctid: (u16, u16, u16),
+    id_info: &Option<(String, String)>,
+) -> Option<(u16, u16, u16)> {
+    // If we have valid ID info, try to find the current CTID for this ID
+    if let Some((id_value, _)) = id_info {
+        unsafe {
+            let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+            if rel.is_null() { return None; }
+            let nsp = (*(*rel).rd_rel).relnamespace;
+            let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+            let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+            if relname.is_null() || nspname.is_null() {
+                pgrx::pg_sys::RelationClose(rel);
+                return None;
+            }
+            let schema = CStr::from_ptr(nspname).to_string_lossy().to_string();
+            let table = CStr::from_ptr(relname).to_string_lossy().to_string();
+            pgrx::pg_sys::RelationClose(rel);
+
+            let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+            let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+
+            let mut refreshed_ctid = None;
+            let _ = pgrx::spi::Spi::connect(|client| {
+                // Try to find current CTID for this ID
+                let sql = format!(
+                    "SELECT ctid::text AS tid FROM {} WHERE id::text = $1 LIMIT 1",
+                    qualified
+                );
+                match client.select(&sql, None, &[id_value.into()]) {
+                    Ok(rows) if rows.len() > 0 => {
+                        if let Ok(Some(tid_txt)) = rows.first().get_by_name::<String, _>("tid") {
+                            if let Some((blk, off)) = parse_tid_text(&tid_txt) {
+                                let bi_hi = (blk >> 16) as u16;
+                                let bi_lo = (blk & 0xFFFF) as u16;
+                                refreshed_ctid = Some((bi_hi, bi_lo, off));
+                                pgrx::info!("ctid-refresh: refreshed stale CTID ({}, {}, {}) to ({}, {}, {}) for id: {}", 
+                                    stale_ctid.0, stale_ctid.1, stale_ctid.2, bi_hi, bi_lo, off, id_value);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        pgrx::warning!("ctid-refresh: could not find current CTID for id: {}", id_value);
+                    }
+                    Err(e) => {
+                        pgrx::warning!("ctid-refresh: failed to query for current CTID: {}", e);
+                    }
+                }
+                Ok::<_, pgrx::spi::Error>(())
+            });
+            refreshed_ctid
+        }
+    } else {
+        None
+    }
+}
+
+
+
+// Add this function after the refresh_stale_ctid function
+fn batch_refresh_ctids(
+    heap_relid: pgrx::pg_sys::Oid,
+    ctids_with_ids: &[(u16, u16, u16, Option<(String, String)>)],
+) -> Vec<(u16, u16, u16)> {
+    let mut refreshed_ctids = Vec::new();
+    
+    // Group CTIDs by ID to batch the queries
+    let mut id_to_ctids: HashMap<String, Vec<(u16, u16, u16)>> = HashMap::new();
+    for (bi_hi, bi_lo, ip_posid, id_info) in ctids_with_ids {
+        if let Some((id_value, _)) = id_info {
+            id_to_ctids.entry(id_value.clone()).or_default().push((*bi_hi, *bi_lo, *ip_posid));
+        }
+    }
+    
+    if id_to_ctids.is_empty() {
+        // No valid IDs to refresh, return original CTIDs
+        return ctids_with_ids.iter().map(|(bi_hi, bi_lo, ip_posid, _)| (*bi_hi, *bi_lo, *ip_posid)).collect();
+    }
+    
+    unsafe {
+        let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+        if rel.is_null() { 
+            return ctids_with_ids.iter().map(|(bi_hi, bi_lo, ip_posid, _)| (*bi_hi, *bi_lo, *ip_posid)).collect();
+        }
+        let nsp = (*(*rel).rd_rel).relnamespace;
+        let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+        let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+        if relname.is_null() || nspname.is_null() {
+            pgrx::pg_sys::RelationClose(rel);
+            return ctids_with_ids.iter().map(|(bi_hi, bi_lo, ip_posid, _)| (*bi_hi, *bi_lo, *ip_posid)).collect();
+        }
+        let schema = CStr::from_ptr(nspname).to_string_lossy().to_string();
+        let table = CStr::from_ptr(relname).to_string_lossy().to_string();
+        pgrx::pg_sys::RelationClose(rel);
+
+        let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+
+        let _ = pgrx::spi::Spi::connect(|client| {
+            // Batch query to get current CTIDs for all IDs
+            let id_values: Vec<&str> = id_to_ctids.keys().map(|s| s.as_str()).collect();
+            let placeholders: Vec<String> = (1..=id_values.len()).map(|i| format!("${}", i)).collect();
+            let sql = format!(
+                "SELECT id::text AS id, ctid::text AS tid FROM {} WHERE id::text IN ({})",
+                qualified,
+                placeholders.join(",")
+            );
+            
+            match client.select(&sql, None, &id_values.iter().map(|&s| s.into()).collect::<Vec<_>>()) {
+                Ok(rows) => {
+                    let mut id_to_current_ctid: HashMap<String, (u16, u16, u16)> = HashMap::new();
+                    for row in rows {
+                        if let (Some(id_txt), Some(tid_txt)) = (row.get_by_name::<String, _>("id").unwrap_or(None), row.get_by_name::<String, _>("tid").unwrap_or(None)) {
+                            if let Some((blk, off)) = parse_tid_text(&tid_txt) {
+                                let bi_hi = (blk >> 16) as u16;
+                                let bi_lo = (blk & 0xFFFF) as u16;
+                                id_to_current_ctid.insert(id_txt, (bi_hi, bi_lo, off));
+                            }
+                        }
+                    }
+                    
+                    // Map back to original order with refreshed CTIDs
+                    for (bi_hi, bi_lo, ip_posid, id_info) in ctids_with_ids {
+                        if let Some((id_value, _)) = id_info {
+                            if let Some(&refreshed_ctid) = id_to_current_ctid.get(id_value) {
+                                if refreshed_ctid != (*bi_hi, *bi_lo, *ip_posid) {
+                                    pgrx::info!("ctid-batch-refresh: refreshed CTID ({}, {}, {}) to ({}, {}, {}) for id: {}", 
+                                        bi_hi, bi_lo, ip_posid, refreshed_ctid.0, refreshed_ctid.1, refreshed_ctid.2, id_value);
+                                }
+                                refreshed_ctids.push(refreshed_ctid);
+                            } else {
+                                // Keep original CTID if refresh failed
+                                refreshed_ctids.push((*bi_hi, *bi_lo, *ip_posid));
+                            }
+                        } else {
+                            // Keep original CTID if no ID info
+                            refreshed_ctids.push((*bi_hi, *bi_lo, *ip_posid));
+                        }
+                    }
+                }
+                Err(e) => {
+                    pgrx::warning!("ctid-batch-refresh: failed to batch refresh CTIDs: {}", e);
+                    // Fall back to original CTIDs
+                    refreshed_ctids = ctids_with_ids.iter().map(|(bi_hi, bi_lo, ip_posid, _)| (*bi_hi, *bi_lo, *ip_posid)).collect();
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+    }
+    
+    refreshed_ctids
 }
 

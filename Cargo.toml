@@ -94,19 +94,18 @@ rust.unused_macro_rules = "warn"
 rust.unused_qualifications = "warn"
 
 [profile.dev]
-codegen-units = 256
+codegen-units = 16  # Reasonable for dev builds
 lto = "off"
 opt-level = 1
-debug = "full"
-strip = "none"
+debug = true
 
 [profile.release]
-codegen-units = 16
-lto = "thin"
-opt-level = 3
-debug = "none"
+codegen-units = 16  # Reduce from 256 for better optimization
+lto = "thin"        # Faster than full LTO
+opt-level = 3       # Maximum optimization
+debug = false       # No debug info in release
 strip = "debuginfo"
-incremental = true
+incremental = true  # Enable incremental compilation for faster rebuilds
 
 [profile.prof]
 inherits = "release"

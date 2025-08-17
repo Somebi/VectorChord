@@ -1,0 +1,8 @@
+[postgres]
+17 = { pg_config = "/usr/bin/pg_config" }
+
+[base_port]
+17 = 28817
+
+[base_testing_port]
+17 = 28818
