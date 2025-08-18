@@ -10,7 +10,7 @@ DB_USER="${DB_USER:-listings_user}"
 DB_PASSWORD="${DB_PASSWORD:-listings_somebi_731}"
 DB_PORT="${DB_PORT:-5432}"
 PG_PORT_IN_CONTAINER=5432
-AUTO_REINDEX="${AUTO_REINDEX:-false}"
+AUTO_REINDEX="${AUTO_REINDEX:-true}"
 
 # Function to wait for PostgreSQL to be ready
 wait_for_postgres() {

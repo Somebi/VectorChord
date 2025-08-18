@@ -5,3 +5,5 @@
 build
 vchord.control
 sql/
+CLAUDE.md
+.cursor/

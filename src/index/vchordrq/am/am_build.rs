@@ -346,7 +346,106 @@ pub unsafe extern "C-unwind" fn ambuild(
                         
                         let [bi_hi, bi_lo, ip_posid] = ctid_to_key(ctid);
                         // Resolve document ID immediately during sampling for reliable tracking
-                        let validated_doc_id_info = id_map.get(&(bi_hi as u32, bi_lo)).cloned();
+                        let block_number = block_from_parts(bi_hi, bi_lo);
+                        
+                        // Debug logging for ID mapping lookup
+                        if tuples_total % 1000 == 0 { // Log every 1000th tuple to avoid spam
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Raw CTID: {:?}", ctid);
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: ctid_to_key result: bi_hi={}, bi_lo={}, ip_posid={}", bi_hi, bi_lo, ip_posid);
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: block_from_parts({}, {}) = {}", bi_hi, bi_lo, block_number);
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Looking up key ({}, {}) in ID map", block_number, ip_posid);
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: ID map size: {}", id_map.len());
+                            
+                            // Show sample keys from the ID map to understand the coordinate system
+                            if tuples_total == 1000 { // Only show once to avoid spam
+                                let mut sample_keys: Vec<_> = id_map.keys().take(5).collect();
+                                sample_keys.sort();
+                                for (i, key) in sample_keys.iter().enumerate() {
+                                    let (col_name, id_value) = &id_map[key];
+                                    pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: ID map sample key {}: {:?} -> col='{}', id='{}'", i, key, col_name, id_value);
+                                }
+                                
+                                // Try to find a key that might match our lookup
+                                let mut found_keys = Vec::new();
+                                for (key, value) in id_map.iter() {
+                                    if key.0 == block_number || key.0 == block_number + 1 || key.0 == block_number - 1 {
+                                        found_keys.push((*key, value.clone()));
+                                        if found_keys.len() >= 3 {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !found_keys.is_empty() {
+                                    pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Found nearby keys: {:?}", found_keys);
+                                }
+                            }
+                        }
+                        
+                        // Show sample keys from the ID map earlier to understand the coordinate system
+                        if tuples_total == 0 { // Show on first tuple
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: First tuple - showing ID map sample keys");
+                            let mut sample_keys: Vec<_> = id_map.keys().take(5).collect();
+                            sample_keys.sort();
+                            for (i, key) in sample_keys.iter().enumerate() {
+                                let (col_name, id_value) = &id_map[key];
+                                pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: ID map sample key {}: {:?} -> col='{}', id='{}'", i, key, col_name, id_value);
+                            }
+                        }
+                        
+                        // Try to find the ID mapping using the same coordinate system as the ID map
+                        let mut validated_doc_id_info = id_map.get(&(block_number, ip_posid)).cloned();
+
+                        // Fallback: if the map lookup failed, resolve by querying the heap using CTID
+                        if validated_doc_id_info.is_none() {
+                            if let Some((col_name, id_value)) = fetch_heap_id_by_ctid(heap_relid, (bi_hi, bi_lo, ip_posid)) {
+                                pgrx::info!(
+                                    "METADATA_FIX_2024_DEBUG_XYZ789: Fallback CTID lookup succeeded: col_name={}, id_value={}",
+                                    col_name,
+                                    id_value
+                                );
+                                validated_doc_id_info = Some((col_name, id_value));
+                            }
+                        }
+                        
+                        // If not found, try to find nearby keys to understand the coordinate system
+                        if validated_doc_id_info.is_none() && tuples_total == 1000 {
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: No ID mapping found for block_number={}, ip_posid={}", block_number, ip_posid);
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: ID map size: {}", id_map.len());
+                            
+                            // Show a few sample keys from the ID map to understand the coordinate system
+                            let mut sample_keys: Vec<_> = id_map.keys().take(5).collect();
+                            sample_keys.sort();
+                            for (i, key) in sample_keys.iter().enumerate() {
+                                let (col_name, id_value) = &id_map[key];
+                                pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: ID map sample key {}: {:?} -> col='{}', id='{}'", i, key, col_name, id_value);
+                            }
+                            
+                            // Try to find a key that might match our lookup
+                            let mut found_keys = Vec::new();
+                            for (key, value) in id_map.iter() {
+                                if key.0 == block_number || key.0 == block_number + 1 || key.0 == block_number - 1 {
+                                    found_keys.push((*key, value.clone()));
+                                    if found_keys.len() >= 3 {
+                                        break;
+                                    }
+                                }
+                            }
+                            if !found_keys.is_empty() {
+                                pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Found nearby keys: {:?}", found_keys);
+                            }
+                        }
+                        
+                        // Debug logging for lookup result
+                        if tuples_total % 1000 == 0 {
+                            match &validated_doc_id_info {
+                                Some((col_name, id_value)) => {
+                                    pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Found ID mapping: col_name={}, id_value={}", col_name, id_value);
+                                }
+                                None => {
+                                    pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: No ID mapping found for block_number={}, ip_posid={}", block_number, ip_posid);
+                                }
+                            }
+                        }
                         
                         if number_of_samples < max_number_of_samples {
                             samples.push(x);
@@ -395,17 +494,39 @@ pub unsafe extern "C-unwind" fn ambuild(
                 
                 // Save metadata for analysis
                 let mut metadata_rows = Vec::with_capacity(samples.len());
+                
+                // UNIQUE_IDENTIFIER: METADATA_FIX_2024_DEBUG_XYZ789 - This confirms latest code is running
+                pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Starting metadata generation with table name resolution");
+                
+                // Get the actual table name from the relation
+                let actual_table_name = unsafe {
+                    let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+                    if !rel.is_null() {
+                        let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+                        if !relname.is_null() {
+                            let table_name = CStr::from_ptr(relname).to_string_lossy().to_string();
+                            pgrx::pg_sys::RelationClose(rel);
+                            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Resolved table name: {}", table_name);
+                            table_name
+                        } else {
+                            pgrx::pg_sys::RelationClose(rel);
+                            pgrx::warning!("METADATA_FIX_2024_DEBUG_XYZ789: Failed to get relname, using unknown");
+                            "unknown".to_string()
+                        }
+                    } else {
+                        pgrx::warning!("METADATA_FIX_2024_DEBUG_XYZ789: Failed to get relation, using unknown");
+                        "unknown".to_string()
+                    }
+                };
+                
                 for (bi_hi, bi_lo, ip_posid, extra, doc_id_info) in &sample_origins {
-                    let doc_id = if let Some((id, _table_name)) = doc_id_info {
-                        id.clone()
+                    let doc_id = if let Some((_column_name, id_value)) = doc_id_info {
+                        id_value.clone()
                     } else {
                         format!("ctid_{}_{}_{}", bi_hi, bi_lo, ip_posid)
                     };
-                    let table_name = if let Some((_, table_name)) = doc_id_info {
-                        table_name.clone()
-                    } else {
-                        "unknown".to_string()
-                    };
+                    // Always emit the resolved table name; fallback to "unknown" only if relation lookup failed
+                    let table_name = actual_table_name.clone();
                     metadata_rows.push(format!("{}|{}|{}_{}_{}|{}", 
                         doc_id, 
                         table_name, 
@@ -456,54 +577,10 @@ pub unsafe extern "C-unwind" fn ambuild(
                         file_path, metadata_file_path, samples.len()
                     );
                 } else {
-                    // If primary path failed, try alternative locations
+                    // If primary path failed, log error and abort
                     let err = write_result.unwrap_err();
                     let metadata_err = metadata_write_result.unwrap_err();
-                    pgrx::warning!("Failed to write {}: {}. Failed to write metadata: {}. Trying fallbacks...", file_path, err, metadata_err);
-                    
-                    let alt_paths = ["/tmp/ann_samples.npy", "./ann_samples.npy"];
-                    let alt_metadata_paths = ["/tmp/ann_samples_metadata.txt", "./ann_samples_metadata.txt"];
-                    let mut saved_path: Option<&str> = None;
-                    let mut saved_metadata_path: Option<&str> = None;
-                    
-                    for (alt_path, alt_metadata_path) in alt_paths.iter().zip(alt_metadata_paths.iter()) {
-                        pgrx::info!("Trying alternative paths: {} and {}", alt_path, alt_metadata_path);
-                        
-                        let samples_result = write_npy(alt_path, &samples_array);
-                        let metadata_result = std::fs::write(alt_metadata_path, metadata_rows.join("\n"));
-                        
-                        if samples_result.is_ok() && metadata_result.is_ok() {
-                            pgrx::info!("Successfully saved {} samples to {}", samples.len(), alt_path);
-                            pgrx::info!("Successfully saved metadata to {}", alt_metadata_path);
-                            saved_path = Some(*alt_path);
-                            saved_metadata_path = Some(*alt_metadata_path);
-                            break;
-                        } else {
-                            if let Err(e) = samples_result {
-                                pgrx::warning!("Failed to write {}: {}", alt_path, e);
-                            }
-                            if let Err(e) = metadata_result {
-                                pgrx::warning!("Failed to write {}: {}", alt_metadata_path, e);
-                            }
-                        }
-                    }
-                    
-                    // Abort indexing whether we succeeded via a fallback or not
-                    if let Some(path) = saved_path {
-                        if let Some(metadata_path) = saved_metadata_path {
-                            pgrx::error!(
-                                "ANN samples saved to {} and metadata to {} ({} vectors). Aborting index build as requested.",
-                                path, metadata_path, samples.len()
-                            );
-                        } else {
-                            pgrx::error!(
-                                "ANN samples saved to {} but metadata failed ({} vectors). Aborting index build as requested.",
-                                path, samples.len()
-                            );
-                        }
-                    } else {
-                        pgrx::error!("Failed to write ANN samples to any location. Aborting index build.");
-                    }
+                    pgrx::error!("Failed to write {}: {}. Failed to write metadata: {}. Aborting index build.", file_path, err, metadata_err);
                 }
             };
             
@@ -1190,6 +1267,12 @@ fn parse_tid_text(t: &str) -> Option<(u32, u16)> {
     let mut it = s.split(',');
     let blk: u32 = it.next()?.trim().parse().ok()?;
     let off: u16 = it.next()?.trim().parse().ok()?;
+    
+    // Debug logging to understand the coordinate system
+    pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: parse_tid_text: '{}' -> blk={}, off={}", t, blk, off);
+    
+    // The CTID text from PostgreSQL shows the actual block number, not bi_hi/bi_lo
+    // So we can use it directly as the block number
     Some((blk, off))
 }
 
@@ -1244,15 +1327,46 @@ fn build_ctid_id_map(heap_relid: pgrx::pg_sys::Oid) -> HashMap<(u32, u16), (Stri
 
             let mut query_and_populate = |col_name: &str| -> Result<bool, pgrx::spi::Error> {
                 let mut populated = false;
+                
+                // First, let's test what the actual block numbers look like
+                if m.is_empty() {
+                    let test_sql = format!("SELECT ctid::text AS tid, {}::text AS id, ctid AS raw_ctid FROM {} LIMIT 5", col_name, tables_to_query[0]);
+                    if let Ok(test_rows) = client.select(&test_sql, None, &[]) {
+                        pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Testing CTID representation:");
+                        for r in test_rows {
+                            if let (Some(tid_txt), Some(id_txt), Some(raw_ctid)) = (
+                                r.get_by_name::<String, _>("tid").unwrap_or(None),
+                                r.get_by_name::<String, _>("id").unwrap_or(None),
+                                r.get_by_name::<ItemPointerData, _>("raw_ctid").unwrap_or(None)
+                            ) {
+                                let [test_bi_hi, test_bi_lo, test_ip_posid] = ctid_to_key(raw_ctid);
+                                let test_block_number = block_from_parts(test_bi_hi, test_bi_lo);
+                                pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: CTID text: '{}', ID: '{}', raw_ctid: {:?}", tid_txt, id_txt, raw_ctid);
+                                pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: ctid_to_key: [bi_hi={}, bi_lo={}, ip_posid={}]", test_bi_hi, test_bi_lo, test_ip_posid);
+                                pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: block_from_parts({}, {}) = {}", test_bi_hi, test_bi_lo, test_block_number);
+                            }
+                        }
+                    }
+                }
+                
                 for t_name in &tables_to_query {
-                    let sql = format!("SELECT ctid::text AS tid, {}::text AS id FROM {}", col_name, t_name);
+                    let sql = format!("SELECT ctid AS raw_ctid, {}::text AS id FROM {}", col_name, t_name);
                     if let Ok(rows) = client.select(&sql, None, &[]) {
                         for r in rows {
-                            if let (Some(tid_txt), Some(id_txt)) = (r.get_by_name::<String, _>("tid").unwrap_or(None), r.get_by_name::<String, _>("id").unwrap_or(None)) {
-                                if let Some((blk, off)) = parse_tid_text(&tid_txt) {
-                                    m.insert((blk, off), (col_name.to_string(), id_txt));
-                                    populated = true;
+                            if let (Some(raw_ctid), Some(id_txt)) = (
+                                r.get_by_name::<ItemPointerData, _>("raw_ctid").unwrap_or(None),
+                                r.get_by_name::<String, _>("id").unwrap_or(None)
+                            ) {
+                                let [bi_hi, bi_lo, ip_posid] = ctid_to_key(raw_ctid);
+                                let blk = block_from_parts(bi_hi, bi_lo);
+                                if m.len() < 5 {
+                                    pgrx::info!(
+                                        "METADATA_FIX_2024_DEBUG_XYZ789: Insert map key (blk={}, off={}) -> col='{}', id='{}'",
+                                        blk, ip_posid, col_name, id_txt
+                                    );
                                 }
+                                m.insert((blk, ip_posid), (col_name.to_string(), id_txt));
+                                populated = true;
                             }
                         }
                     }
@@ -1293,6 +1407,18 @@ fn build_ctid_id_map(heap_relid: pgrx::pg_sys::Oid) -> HashMap<(u32, u16), (Stri
             if used_pk { "primary key" } else { "id column" },
             is_partition || is_partitioned_parent,
         );
+        
+        // Debug logging to show sample keys in the ID map
+        if !m.is_empty() {
+            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: ID map built successfully with {} entries", m.len());
+            let mut sample_keys: Vec<_> = m.keys().take(5).collect();
+            sample_keys.sort();
+            for (i, key) in sample_keys.iter().enumerate() {
+                let (col_name, id_value) = &m[key];
+                pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: Sample key {}: {:?} -> col='{}', id='{}'", i, key, col_name, id_value);
+            }
+        }
+        
         if m.is_empty() {
             pgrx::warning!("id-map: empty map built; will rely on per-CTID fallback");
         }
@@ -1305,9 +1431,51 @@ fn id_from_map(
     id_map: &HashMap<(u32, u16), (String, String)>,
     doc_id: (u16, u16, u16),
 ) -> Option<(String, String)> {
-    let blk = block_from_parts(doc_id.0, doc_id.1);
+    // The doc_id is in the format (bi_hi, bi_lo, ip_posid) from the internal CTID structure
+    // But the ID map was built using CTID text which shows the actual block number directly
+    // We need to convert the internal CTID to match the coordinate system used in the ID map
+    
+    // Option 1: Use block_from_parts (current approach - may be wrong)
+    let blk_from_parts = block_from_parts(doc_id.0, doc_id.1);
+    
+    // Option 2: Use the bi_hi directly as the block number (if bi_lo is always 0 for small tables)
+    let blk_direct = doc_id.0 as u32;
+    
+    // Option 3: Try both approaches to see which one works
     let off = doc_id.2;
-    id_map.get(&(blk, off)).cloned()
+    
+    // Debug logging to understand the coordinate system conversion
+    pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: id_from_map: doc_id={:?} -> blk_from_parts={}, blk_direct={}, off={}", doc_id, blk_from_parts, blk_direct, off);
+    pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: id_from_map: looking up keys ({}, {}) and ({}, {}) in map with {} entries", blk_from_parts, off, blk_direct, off, id_map.len());
+    
+    // Log a few sample keys from the map for debugging
+    if id_map.len() <= 10 {
+        for (key, value) in id_map.iter().take(5) {
+            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: id_from_map: map contains key {:?} -> {:?}", key, value);
+        }
+    } else {
+        // For larger maps, show a few sample keys to understand the coordinate system
+        let mut sample_keys: Vec<_> = id_map.keys().take(5).collect();
+        sample_keys.sort();
+        for (i, key) in sample_keys.iter().enumerate() {
+            let (col_name, id_value) = &id_map[key];
+            pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: id_from_map: sample key {}: {:?} -> col='{}', id='{}'", i, key, col_name, id_value);
+        }
+    }
+    
+    // Try both coordinate systems to see which one works
+    if let Some(result) = id_map.get(&(blk_from_parts, off)) {
+        pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: id_from_map: found using block_from_parts({}, {})", blk_from_parts, off);
+        return Some(result.clone());
+    }
+    
+    if let Some(result) = id_map.get(&(blk_direct, off)) {
+        pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: id_from_map: found using blk_direct({}, {})", blk_direct, off);
+        return Some(result.clone());
+    }
+    
+    pgrx::info!("METADATA_FIX_2024_DEBUG_XYZ789: id_from_map: no match found for either coordinate system");
+    None
 }
 
 // Add this structure to track cluster assignments with centroid info
@@ -2209,6 +2377,8 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
         let nsp = (*(*rel).rd_rel).relnamespace;
         let relname = pgrx::pg_sys::get_rel_name(heap_relid);
         let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+        let is_partition = (*(*rel).rd_rel).relispartition;
+        let is_partitioned_parent = (*(*rel).rd_rel).relkind == pgrx::pg_sys::RELKIND_PARTITIONED_TABLE as i8;
         if relname.is_null() || nspname.is_null() {
             pgrx::pg_sys::RelationClose(rel);
             return None;
@@ -2224,11 +2394,11 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
 
         let mut value: Option<(String, String)> = None;
         let _ = pgrx::spi::Spi::connect(|client| {
-            // First check if this is a partitioned table
-            let partition_check_sql = "SELECT 1 FROM pg_catalog.pg_class WHERE oid = $1::regclass AND relispartition";
-            let is_partitioned = match client.select(partition_check_sql, None, &[heap_relid.into()]) {
-                Ok(rows) => rows.len() > 0,
-                Err(_) => false,
+            // Build list of tables to probe for CTID matches
+            let tables_to_query: Vec<String> = if is_partitioned_parent {
+                get_table_partitions(heap_relid, client)
+            } else {
+                vec![qualified.clone()]
             };
 
             let check_sql = "SELECT 1 FROM pg_catalog.pg_attribute\n             WHERE attrelid = $1::regclass AND attname = 'id' AND NOT attisdropped\n             LIMIT 1";
@@ -2246,46 +2416,49 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
             let tid_param = format!("({}, {})", block, posid);
             if has_id {
                 pgrx::info!("id-lookup: 'id' column found, querying with ctid...");
-                
-                // Try with ONLY first (for non-partitioned tables)
-                let sql = format!(
-                    "SELECT id::text AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
-                    qualified
-                );
-                match client.select(&sql, None, &[tid_param.clone().into()]) {
-                    Ok(rows) if rows.len() > 0 => {
-                        if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
-                            pgrx::info!("id-lookup: success using 'id' column (ONLY). Found id: {}", id);
-                            value = Some(("id".to_string(), id));
-                            return Ok::<_, pgrx::spi::Error>(());
-                        }
-                    }
-                    Ok(_) => {
-                        // Retry without ONLY (for partitioned tables or if ONLY failed)
-                        let sql_all = format!(
-                            "SELECT id::text AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
-                            qualified
-                        );
-                        match client.select(&sql_all, None, &[tid_param.clone().into()]) {
-                            Ok(rows) if rows.len() > 0 => {
-                                if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
-                                    pgrx::info!("id-lookup: success using 'id' column (no ONLY). Found id: {}", id);
-                                    value = Some(("id".to_string(), id));
-                                    return Ok::<_, pgrx::spi::Error>(());
-                                }
+                // Probe all candidate tables (parent or partitions)
+                for tname in &tables_to_query {
+                    // Try with ONLY first (narrow scan)
+                    let sql_only = format!(
+                        "SELECT id::text AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
+                        tname
+                    );
+                    match client.select(&sql_only, None, &[tid_param.clone().into()]) {
+                        Ok(rows) if rows.len() > 0 => {
+                            if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                pgrx::info!("id-lookup: success using 'id' column (ONLY) on {}. Found id: {}", tname, id);
+                                value = Some(("id".to_string(), id));
+                                return Ok::<_, pgrx::spi::Error>(());
                             }
-                            Ok(_) => {
-                                if is_partitioned {
-                                    pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY) - this may indicate the CTID refers to a partition that no longer exists or has been dropped");
-                                } else {
-                                    pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY) - CTID ({}, {}) may be stale or refer to deleted data", block, posid);
-                                }
-                                pgrx::info!("id-lookup: query for 'id' with ctid returned 0 rows (no ONLY)");
-                            },
-                            Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed (no ONLY): {}", e),
                         }
+                        Ok(_) => {
+                            // If ONLY fails, try without ONLY
+                            let sql_all = format!(
+                                "SELECT id::text AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
+                                tname
+                            );
+                            match client.select(&sql_all, None, &[tid_param.clone().into()]) {
+                                Ok(rows) if rows.len() > 0 => {
+                                    if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                        pgrx::info!("id-lookup: success using 'id' column (no ONLY) on {}. Found id: {}", tname, id);
+                                        value = Some(("id".to_string(), id));
+                                        return Ok::<_, pgrx::spi::Error>(());
+                                    }
+                                }
+                                Ok(_) => {
+                                    // keep trying other partitions
+                                },
+                                Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed on {}: {}", tname, e),
+                            }
+                        }
+                        Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed (ONLY) on {}: {}", tname, e),
                     }
-                    Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed (ONLY): {}", e),
+                }
+                // If we reach here, not found in any candidate table
+                if is_partitioned_parent {
+                    pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows on all partitions - CTID ({}, {}) may be stale or refer to deleted data", block, posid);
+                } else {
+                    pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows - CTID ({}, {}) may be stale or refer to deleted data", block, posid);
                 }
             } else {
                 pgrx::info!("id-lookup: 'id' column not found. Checking for primary key...");
@@ -2299,43 +2472,46 @@ fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16))
                     if let Some(pk_col_name) = pk_rows.first().get_by_name::<String, _>("colname").unwrap_or(None) {
                         pgrx::info!("id-lookup: found primary key column: '{}'. Querying with ctid...", pk_col_name);
                         let col_quoted = quote_ident(&pk_col_name);
-                        let sql = format!(
-                            "SELECT ({}::text) AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
-                            col_quoted, qualified
-                        );
-                         match client.select(&sql, None, &[tid_param.clone().into()]) {
-                            Ok(rows) if rows.len() > 0 => {
-                                if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
-                                    pgrx::info!("id-lookup: success using PK column '{}' (ONLY). Found id: {}", pk_col_name, id);
-                                    value = Some((pk_col_name.clone(), id));
-                                    return Ok::<_, pgrx::spi::Error>(());
-                                }
-                            }
-                            Ok(_) => {
-                                let sql_all = format!(
-                                    "SELECT ({}::text) AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
-                                    col_quoted, qualified
-                                );
-                                match client.select(&sql_all, None, &[tid_param.clone().into()]) {
-                                     Ok(rows) if rows.len() > 0 => {
-                                        if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
-                                            pgrx::info!("id-lookup: success using PK column '{}' (no ONLY). Found id: {}", pk_col_name, id);
-                                            value = Some((pk_col_name.clone(), id));
-                                            return Ok::<_, pgrx::spi::Error>(());
-                                        }
+                        // Probe all candidate tables (parent or partitions)
+                        for tname in &tables_to_query {
+                            let sql_only = format!(
+                                "SELECT ({}::text) AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
+                                col_quoted, tname
+                            );
+                            match client.select(&sql_only, None, &[tid_param.clone().into()]) {
+                                Ok(rows) if rows.len() > 0 => {
+                                    if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                        pgrx::info!("id-lookup: success using PK column '{}' (ONLY) on {}. Found id: {}", pk_col_name, tname, id);
+                                        value = Some((pk_col_name.clone(), id));
+                                        return Ok::<_, pgrx::spi::Error>(());
                                     }
-                                    Ok(_) => {
-                                        if is_partitioned {
-                                            pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY) - this may indicate the CTID refers to a partition that no longer exists or has been dropped", pk_col_name);
-                                        } else {
-                                            pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY) - CTID ({}, {}) may be stale or refer to deleted data", pk_col_name, block, posid);
-                                        }
-                                        pgrx::info!("id-lookup: query for PK '{}' with ctid returned 0 rows (no ONLY)", pk_col_name);
-                                    },
-                                    Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed (no ONLY): {}", pk_col_name, e),
                                 }
+                                Ok(_) => {
+                                    let sql_all = format!(
+                                        "SELECT ({}::text) AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
+                                        col_quoted, tname
+                                    );
+                                    match client.select(&sql_all, None, &[tid_param.clone().into()]) {
+                                        Ok(rows) if rows.len() > 0 => {
+                                            if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                                pgrx::info!("id-lookup: success using PK column '{}' (no ONLY) on {}. Found id: {}", pk_col_name, tname, id);
+                                                value = Some((pk_col_name.clone(), id));
+                                                return Ok::<_, pgrx::spi::Error>(());
+                                            }
+                                        }
+                                        Ok(_) => {
+                                            // continue with next partition
+                                        },
+                                        Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed on {}: {}", pk_col_name, tname, e),
+                                    }
+                                }
+                                Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed (ONLY) on {}: {}", pk_col_name, tname, e),
                             }
-                            Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed (ONLY): {}", pk_col_name, e),
+                        }
+                        if is_partitioned_parent {
+                            pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows on all partitions - CTID ({}, {}) may be stale or refer to deleted data", pk_col_name, block, posid);
+                        } else {
+                            pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows - CTID ({}, {}) may be stale or refer to deleted data", pk_col_name, block, posid);
                         }
                     }
                 }
@@ -2355,7 +2531,7 @@ fn refresh_stale_ctid(
     id_info: &Option<(String, String)>,
 ) -> Option<(u16, u16, u16)> {
     // If we have valid ID info, try to find the current CTID for this ID
-    if let Some((id_value, _)) = id_info {
+    if let Some((_, id_value)) = id_info {
         unsafe {
             let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
             if rel.is_null() { return None; }
