@@ -1374,22 +1374,26 @@ fn build_ctid_id_map(heap_relid: pgrx::pg_sys::Oid) -> HashMap<(u32, u16), (Stri
                 Ok(populated)
             };
 
-            if query_and_populate("id")? {
-                // Populated with "id"
-            } else {
-                let pk_sql = format!(
-                    "SELECT a.attname AS colname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = {} AND i.indisprimary AND a.attnum > 0 AND NOT a.attisdropped ORDER BY array_position(i.indkey, a.attnum) ASC LIMIT 1",
-                    parent_relid // Use parent relid for PK lookup
-                );
-                if let Ok(pk_rows) = client.select(&pk_sql, None, &[]) {
-                    if let Some(col) = pk_rows.first().get_by_name::<String, _>("colname").unwrap_or(None) {
-                        used_pk = true;
-                        if query_and_populate(&format!("\"{}\"", col.replace('"', "\"\"")))? {
-                            // Populated with PK
-                        }
-                    }
+            let pk_sql = format!(
+                "SELECT a.attname AS colname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = {} AND i.indisprimary AND a.attnum > 0 AND NOT a.attisdropped ORDER BY array_position(i.indkey, a.attnum) ASC LIMIT 1",
+                parent_relid // Use parent relid for PK lookup
+            );
+
+            let pk_col: Option<String> = client.select(&pk_sql, Some(1), &[])
+                .ok()
+                .and_then(|table| table.get_one::<String>(0))
+                .and_then(|r| r.ok());
+
+            if let Some(col) = pk_col {
+                used_pk = true;
+                if query_and_populate(&format!("\"{}\"", col.replace('"', "\"\"")))? {
+                    // Populated with PK
                 }
-                if !used_pk {
+            } else {
+                // Fallback to 'id' or 'ad_id' if no primary key is found
+                if query_and_populate("id")? {
+                    // Populated with "id"
+                } else {
                     let has_ad_id_sql = format!("SELECT 1 FROM pg_attribute WHERE attrelid = {} AND attname = 'ad_id' AND NOT attisdropped LIMIT 1", heap_relid);
                     if client.select(&has_ad_id_sql, None, &[]).map(|r| r.len() > 0).unwrap_or(false) {
                         if query_and_populate("ad_id")? {
@@ -1503,12 +1507,24 @@ struct ClusterInfo {
 fn get_table_partitions(heap_relid: pgrx::pg_sys::Oid, client: &pgrx::spi::SpiClient) -> Vec<String> {
     let mut partitions = Vec::new();
     let query = format!(
-        "SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = {}",
+        r#"
+        WITH RECURSIVE partitions AS (
+            SELECT inhrelid
+            FROM pg_inherits
+            WHERE inhparent = {}
+            UNION ALL
+            SELECT i.inhrelid
+            FROM pg_inherits i, partitions p
+            WHERE i.inhparent = p.inhrelid
+        )
+        SELECT inhrelid::regclass::text AS part_name FROM partitions
+        "#,
         heap_relid
     );
+
     if let Ok(table) = client.select(&query, None, &[]) {
         for row in table {
-            if let Ok(Some(part_name)) = row.get_by_name::<String, _>("inhrelid") {
+            if let Ok(Some(part_name)) = row.get_by_name::<String, _>("part_name") {
                 partitions.push(part_name);
             }
         }
@@ -2564,6 +2580,318 @@ fn refresh_stale_ctid(
                                 let bi_lo = (blk & 0xFFFF) as u16;
                                 refreshed_ctid = Some((bi_hi, bi_lo, off));
                                 pgrx::info!("ctid-refresh: refreshed stale CTID ({}, {}, {}) to ({}, {}, {}) for id: {}", 
+                                    stale_ctid.0, stale_ctid.1, stale_ctid.2, bi_hi, bi_lo, off, id_value);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        pgrx::warning!("ctid-refresh: could not find current CTID for id: {}", id_value);
+                    }
+                    Err(e) => {
+                        pgrx::warning!("ctid-refresh: failed to query for current CTID: {}", e);
+                    }
+                }
+                Ok::<_, pgrx::spi::Error>(())
+            });
+            refreshed_ctid
+        }
+    } else {
+        None
+    }
+}
+
+
+
+// Add this function after the refresh_stale_ctid function
+fn batch_refresh_ctids(
+    heap_relid: pgrx::pg_sys::Oid,
+    ctids_with_ids: &[(u16, u16, u16, Option<(String, String)>)],
+) -> Vec<(u16, u16, u16)> {
+    let mut refreshed_ctids = Vec::new();
+
+    // Group CTIDs by ID to batch the queries
+    let mut id_to_ctids: HashMap<String, Vec<(u16, u16, u16)>> = HashMap::new();
+    for (bi_hi, bi_lo, ip_posid, id_info) in ctids_with_ids {
+        if let Some((id_value, _)) = id_info {
+            id_to_ctids.entry(id_value.clone()).or_default().push((*bi_hi, *bi_lo, *ip_posid));
+        }
+    }
+
+    if id_to_ctids.is_empty() {
+        // No valid IDs to refresh, return original CTIDs
+        return ctids_with_ids.iter().map(|(bi_hi, bi_lo, ip_posid, _)| (*bi_hi, *bi_lo, *ip_posid)).collect();
+    }
+
+    unsafe {
+        let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+        if rel.is_null() {
+            return ctids_with_ids.iter().map(|(bi_hi, bi_lo, ip_posid, _)| (*bi_hi, *bi_lo, *ip_posid)).collect();
+        }
+        let nsp = (*(*rel).rd_rel).relnamespace;
+        let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+        let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+        if relname.is_null() || nspname.is_null() {
+            pgrx::pg_sys::RelationClose(rel);
+            return ctids_with_ids.iter().map(|(bi_hi, bi_lo, ip_posid, _)| (*bi_hi, *bi_lo, *ip_posid)).collect();
+        }
+        let schema = CStr::from_ptr(nspname).to_string_lossy().to_string();
+        let table = CStr::from_ptr(relname).to_string_lossy().to_string();
+        pgrx::pg_sys::RelationClose(rel);
+
+        let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+
+        let _ = pgrx::spi::Spi::connect(|client| {
+            // Batch query to get current CTIDs for all IDs
+            let id_values: Vec<&str> = id_to_ctids.keys().map(|s| s.as_str()).collect();
+            let placeholders: Vec<String> = (1..=id_values.len()).map(|i| format!("${}", i)).collect();
+            let sql = format!(
+                "SELECT id::text AS id, ctid::text AS tid FROM {} WHERE id::text IN ({})",
+                qualified,
+                placeholders.join(",")
+            );
+
+            match client.select(&sql, None, &id_values.iter().map(|&s| s.into()).collect::<Vec<_>>()) {
+                Ok(rows) => {
+                    let mut id_to_current_ctid: HashMap<String, (u16, u16, u16)> = HashMap::new();
+                    for row in rows {
+                        if let (Some(id_txt), Some(tid_txt)) = (row.get_by_name::<String, _>("id").unwrap_or(None), row.get_by_name::<String, _>("tid").unwrap_or(None)) {
+                            if let Some((blk, off)) = parse_tid_text(&tid_txt) {
+                                let bi_hi = (blk >> 16) as u16;
+                                let bi_lo = (blk & 0xFFFF) as u16;
+                                id_to_current_ctid.insert(id_txt, (bi_hi, bi_lo, off));
+                            }
+                        }
+                    }
+
+                    // Map back to original order with refreshed CTIDs
+                    for (bi_hi, bi_lo, ip_posid, id_info) in ctids_with_ids {
+                        if let Some((id_value, _)) = id_info {
+                            if let Some(&refreshed_ctid) = id_to_current_ctid.get(id_value) {
+                                if refreshed_ctid != (*bi_hi, *bi_lo, *ip_posid) {
+                                    pgrx::info!("ctid-batch-refresh: refreshed CTID ({}, {}, {}) to ({}, {}, {}) for id: {}",
+                                        bi_hi, bi_lo, ip_posid, refreshed_ctid.0, refreshed_ctid.1, refreshed_ctid.2, id_value);
+                                }
+                                refreshed_ctids.push(refreshed_ctid);
+                            } else {
+                                // Keep original CTID if refresh failed
+                                refreshed_ctids.push((*bi_hi, *bi_lo, *ip_posid));
+                            }
+                        } else {
+                            // Keep original CTID if no ID info
+                            refreshed_ctids.push((*bi_hi, *bi_lo, *ip_posid));
+                        }
+                    }
+                }
+                Err(e) => {
+                    pgrx::warning!("ctid-batch-refresh: failed to batch refresh CTIDs: {}", e);
+                    // Fall back to original CTIDs
+                    refreshed_ctids = ctids_with_ids.iter().map(|(bi_hi, bi_lo, ip_posid, _)| (*bi_hi, *bi_lo, *ip_posid)).collect();
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+    }
+
+    refreshed_ctids
+}
+
+fn fetch_heap_id_by_ctid(heap_relid: pgrx::pg_sys::Oid, doc_id: (u16, u16, u16)) -> Option<(String, String)> {
+    pgrx::info!("DEBUG: Entering fetch_heap_id_by_ctid");
+    // Resolve schema-qualified table name from relid
+    unsafe {
+        let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+        if rel.is_null() { return None; }
+        let nsp = (*(*rel).rd_rel).relnamespace;
+        let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+        let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+        let is_partition = (*(*rel).rd_rel).relispartition;
+        let is_partitioned_parent = (*(*rel).rd_rel).relkind == pgrx::pg_sys::RELKIND_PARTITIONED_TABLE as i8;
+        if relname.is_null() || nspname.is_null() {
+            pgrx::pg_sys::RelationClose(rel);
+            return None;
+        }
+        let schema = CStr::from_ptr(nspname).to_string_lossy().to_string();
+        let table = CStr::from_ptr(relname).to_string_lossy().to_string();
+        pgrx::pg_sys::RelationClose(rel);
+
+        let block: u32 = ((doc_id.0 as u32) << 16) | (doc_id.1 as u32);
+        let posid: u16 = doc_id.2;
+        let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+
+        let mut value: Option<(String, String)> = None;
+        let _ = pgrx::spi::Spi::connect(|client| {
+            // Build list of tables to probe for CTID matches
+            let tables_to_query: Vec<String> = if is_partitioned_parent {
+                get_table_partitions(heap_relid, client)
+            } else {
+                vec![qualified.clone()]
+            };
+
+            let check_sql = "SELECT 1 FROM pg_catalog.pg_attribute\n             WHERE attrelid = $1::regclass AND attname = 'id' AND NOT attisdropped\n             LIMIT 1";
+            let has_id = match client.select(check_sql, None, &[heap_relid.into()]) {
+                Ok(rows) => {
+                    pgrx::info!("id-lookup: check for 'id' column returned {} rows", rows.len());
+                    rows.len() > 0
+                },
+                Err(e) => {
+                    pgrx::warning!("id-lookup: check for 'id' column failed: {}", e);
+                    false
+                },
+            };
+            // Use a single text parameter and cast to tid: $1::tid
+            let tid_param = format!("({}, {})", block, posid);
+            if has_id {
+                pgrx::info!("id-lookup: 'id' column found, querying with ctid...");
+                // Probe all candidate tables (parent or partitions)
+                for tname in &tables_to_query {
+                    // Try with ONLY first (narrow scan)
+                    let sql_only = format!(
+                        "SELECT id::text AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
+                        tname
+                    );
+                    match client.select(&sql_only, None, &[tid_param.clone().into()]) {
+                        Ok(rows) if rows.len() > 0 => {
+                            if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                pgrx::info!("id-lookup: success using 'id' column (ONLY) on {}. Found id: {}", tname, id);
+                                value = Some(("id".to_string(), id));
+                                return Ok::<_, pgrx::spi::Error>(());
+                            }
+                        }
+                        Ok(_) => {
+                            // If ONLY fails, try without ONLY
+                            let sql_all = format!(
+                                "SELECT id::text AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
+                                tname
+                            );
+                            match client.select(&sql_all, None, &[tid_param.clone().into()]) {
+                                Ok(rows) if rows.len() > 0 => {
+                                    if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                        pgrx::info!("id-lookup: success using 'id' column (no ONLY) on {}. Found id: {}", tname, id);
+                                        value = Some(("id".to_string(), id));
+                                        return Ok::<_, pgrx::spi::Error>(());
+                                    }
+                                }
+                                Ok(_) => {
+                                    // keep trying other partitions
+                                },
+                                Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed on {}: {}", tname, e),
+                            }
+                        }
+                        Err(e) => pgrx::warning!("id-lookup: query for 'id' with ctid failed (ONLY) on {}: {}", tname, e),
+                    }
+                }
+                // If we reach here, not found in any candidate table
+                if is_partitioned_parent {
+                    pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows on all partitions - CTID ({}, {}) may be stale or refer to deleted data", block, posid);
+                } else {
+                    pgrx::warning!("id-lookup: query for 'id' with ctid returned 0 rows - CTID ({}, {}) may be stale or refer to deleted data", block, posid);
+                }
+            } else {
+                pgrx::info!("id-lookup: 'id' column not found. Checking for primary key...");
+            }
+            if value.is_some() { return Ok::<_, pgrx::spi::Error>(()); }
+
+            // 2. Try with Primary Key
+            let pk_sql = "SELECT a.attname AS colname\n               FROM pg_index i\n               JOIN pg_attribute a\n                 ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)\n              WHERE i.indrelid = $1::regclass AND i.indisprimary\n                AND a.attnum > 0 AND NOT a.attisdropped\n              ORDER BY array_position(i.indkey, a.attnum) ASC\n              LIMIT 1";
+            match client.select(pk_sql, None, &[heap_relid.into()]) {
+                Ok(pk_rows) if pk_rows.len() > 0 => {
+                    if let Some(pk_col_name) = pk_rows.first().get_by_name::<String, _>("colname").unwrap_or(None) {
+                        pgrx::info!("id-lookup: found primary key column: '{}'. Querying with ctid...", pk_col_name);
+                        let col_quoted = quote_ident(&pk_col_name);
+                        // Probe all candidate tables (parent or partitions)
+                        for tname in &tables_to_query {
+                            let sql_only = format!(
+                                "SELECT ({}::text) AS id FROM ONLY {} WHERE ctid = $1::tid LIMIT 1",
+                                col_quoted, tname
+                            );
+                            match client.select(&sql_only, None, &[tid_param.clone().into()]) {
+                                Ok(rows) if rows.len() > 0 => {
+                                    if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                        pgrx::info!("id-lookup: success using PK column '{}' (ONLY) on {}. Found id: {}", pk_col_name, tname, id);
+                                        value = Some((pk_col_name.clone(), id));
+                                        return Ok::<_, pgrx::spi::Error>(());
+                                    }
+                                }
+                                Ok(_) => {
+                                    let sql_all = format!(
+                                        "SELECT ({}::text) AS id FROM {} WHERE ctid = $1::tid LIMIT 1",
+                                        col_quoted, tname
+                                    );
+                                    match client.select(&sql_all, None, &[tid_param.clone().into()]) {
+                                        Ok(rows) if rows.len() > 0 => {
+                                            if let Ok(Some(id)) = rows.first().get_by_name::<String, _>("id") {
+                                                pgrx::info!("id-lookup: success using PK column '{}' (no ONLY) on {}. Found id: {}", pk_col_name, tname, id);
+                                                value = Some((pk_col_name.clone(), id));
+                                                return Ok::<_, pgrx::spi::Error>(());
+                                            }
+                                        }
+                                        Ok(_) => {
+                                            // continue with next partition
+                                        },
+                                        Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed on {}: {}", pk_col_name, tname, e),
+                                    }
+                                }
+                                Err(e) => pgrx::warning!("id-lookup: query for PK '{}' with ctid failed (ONLY) on {}: {}", pk_col_name, tname, e),
+                            }
+                        }
+                        if is_partitioned_parent {
+                            pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows on all partitions - CTID ({}, {}) may be stale or refer to deleted data", pk_col_name, block, posid);
+                        } else {
+                            pgrx::warning!("id-lookup: query for PK '{}' with ctid returned 0 rows - CTID ({}, {}) may be stale or refer to deleted data", pk_col_name, block, posid);
+                        }
+                    }
+                }
+                Ok(_) => pgrx::info!("id-lookup: no primary key found for table."),
+                Err(e) => pgrx::warning!("id-lookup: primary key lookup failed: {}", e),
+            }
+            Ok::<_, pgrx::spi::Error>(())
+        });
+        return value;
+    }
+}
+
+// Add this function after the fetch_heap_id_by_ctid function
+fn refresh_stale_ctid(
+    heap_relid: pgrx::pg_sys::Oid,
+    stale_ctid: (u16, u16, u16),
+    id_info: &Option<(String, String)>,
+) -> Option<(u16, u16, u16)> {
+    // If we have valid ID info, try to find the current CTID for this ID
+    if let Some((_, id_value)) = id_info {
+        unsafe {
+            let rel = pgrx::pg_sys::RelationIdGetRelation(heap_relid);
+            if rel.is_null() { return None; }
+            let nsp = (*(*rel).rd_rel).relnamespace;
+            let relname = pgrx::pg_sys::get_rel_name(heap_relid);
+            let nspname = pgrx::pg_sys::get_namespace_name(nsp);
+            if relname.is_null() || nspname.is_null() {
+                pgrx::pg_sys::RelationClose(rel);
+                return None;
+            }
+            let schema = CStr::from_ptr(nspname).to_string_lossy().to_string();
+            let table = CStr::from_ptr(relname).to_string_lossy().to_string();
+            pgrx::pg_sys::RelationClose(rel);
+
+            let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+            let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
+
+            let mut refreshed_ctid = None;
+            let _ = pgrx::spi::Spi::connect(|client| {
+                // Try to find current CTID for this ID
+                let sql = format!(
+                    "SELECT ctid::text AS tid FROM {} WHERE id::text = $1 LIMIT 1",
+                    qualified
+                );
+                match client.select(&sql, None, &[id_value.into()]) {
+                    Ok(rows) if rows.len() > 0 => {
+                        if let Ok(Some(tid_txt)) = rows.first().get_by_name::<String, _>("tid") {
+                            if let Some((blk, off)) = parse_tid_text(&tid_txt) {
+                                let bi_hi = (blk >> 16) as u16;
+                                let bi_lo = (blk & 0xFFFF) as u16;
+                                refreshed_ctid = Some((bi_hi, bi_lo, off));
+                                pgrx::info!("ctid-refresh: refreshed stale CTID ({}, {}, {}) to ({}, {}, {}) for id: {}",
                                     stale_ctid.0, stale_ctid.1, stale_ctid.2, bi_hi, bi_lo, off, id_value);
                             }
                         }
